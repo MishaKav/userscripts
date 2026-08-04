@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.4.0
+// @version      1.5.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,12 +19,18 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.4.0';
+  const VERSION = '1.5.0';
 
   // verbose console logs for debugging - set to false to silence
   const DEBUG = true;
 
-  // one of these is picked randomly on every approve, add/remove as you like
+  // automatically select the approve option when the review dialog opens
+  const AUTO_SELECT_APPROVE = true;
+
+  // always inserted on approve - pick from the dropdown to replace it
+  const DEFAULT_COMMENT = 'LGTM';
+
+  // the alternatives offered in the dropdown ('🎲 Random' picks one of these)
   const APPROVE_COMMENTS = [
     'LGTM',
     'LGTM 👍',
@@ -156,10 +162,9 @@
       return;
     }
 
-    const comment = pickComment();
-    setNativeValue(textarea, comment);
-    textarea.setAttribute(AUTO_FILL_ATTRIBUTE, comment);
-    console.log(`[GitHub PR Approve Helper] filled review comment: "${comment}"`);
+    setNativeValue(textarea, DEFAULT_COMMENT);
+    textarea.setAttribute(AUTO_FILL_ATTRIBUTE, DEFAULT_COMMENT);
+    console.log(`[GitHub PR Approve Helper] filled review comment: "${DEFAULT_COMMENT}"`);
   };
 
   const clearAutoComment = (textarea) => {
@@ -248,11 +253,26 @@
   const createCommentDropdown = () => {
     const select = document.createElement('select');
     select.id = DROPDOWN_ID;
-    select.className = 'form-select';
-    select.style.cssText = 'width: 100%; margin-bottom: 8px;';
+    // compact pill floating in the dialog header, next to the close button -
+    // it never disturbs the layout of the react-rendered dialog content
+    select.style.cssText = [
+      'position: absolute',
+      'top: 12px',
+      'right: 48px',
+      'max-width: 200px',
+      'padding: 4px 8px',
+      'font-size: 12px',
+      'font-weight: 500',
+      'color: #1f2328',
+      'background: #f6f8fa',
+      'border: 1px solid #d0d7de',
+      'border-radius: 6px',
+      'cursor: pointer',
+      'z-index: 100',
+    ].join(';');
 
     const options = [
-      { value: '', text: '💬 Insert approve comment…' },
+      { value: '', text: `💬 ${DEFAULT_COMMENT}…` },
       { value: RANDOM_OPTION_VALUE, text: '🎲 Random' },
       ...APPROVE_COMMENTS.map((comment) => ({ value: comment, text: comment })),
     ];
@@ -337,16 +357,30 @@
       }
 
       if (!container.querySelector(`#${DROPDOWN_ID}`)) {
-        textarea.before(createCommentDropdown());
+        // anchor the absolutely-positioned dropdown to the dialog itself
+        if (getComputedStyle(container).position === 'static') {
+          container.style.position = 'relative';
+        }
+        container.appendChild(createCommentDropdown());
         console.log('[GitHub PR Approve Helper] review dialog found, dropdown added');
       }
 
-      // the dialog can open with approve already pre-selected (github
-      // remembers the last choice), which fires no change event - fill once
+      // once per dialog open: select approve (github opens with the last
+      // used option, and a pre-selected radio fires no change event)
       if (!container.hasAttribute(SEEN_ATTRIBUTE)) {
         container.setAttribute(SEEN_ATTRIBUTE, 'true');
+        const approveRadio = radios.find(isApprove);
 
-        if (radios.find(isApprove)?.checked) {
+        if (!approveRadio) {
+          continue;
+        }
+
+        if (AUTO_SELECT_APPROVE && !approveRadio.checked) {
+          debug('auto-selecting approve');
+          approveRadio.click();
+        }
+
+        if (approveRadio.checked) {
           fillComment(textarea);
         }
       }
