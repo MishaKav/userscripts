@@ -106,10 +106,17 @@
   // react-controlled textarea ignores a plain `.value =`, so assign through
   // the native prototype setter and fire bubbled events for react to notice
   const setNativeValue = (textarea, text) => {
-    Object.getOwnPropertyDescriptor(
+    const nativeSetter = Object.getOwnPropertyDescriptor(
       HTMLTextAreaElement.prototype,
       'value',
-    ).set.call(textarea, text);
+    )?.set;
+
+    if (nativeSetter) {
+      nativeSetter.call(textarea, text);
+    } else {
+      textarea.value = text;
+    }
+
     textarea.dispatchEvent(new Event('input', { bubbles: true }));
     textarea.dispatchEvent(new Event('change', { bubbles: true }));
   };
@@ -252,15 +259,21 @@
     return select;
   };
 
+  // shown once per page/soft-navigation, tracked by pathname
+  let badgeShownFor = null;
+
   const showActiveBadge = () => {
     if (
       !SHOW_ACTIVE_BADGE ||
       !isPullRequestPage() ||
       !isAllowedOrgPage() ||
+      badgeShownFor === location.pathname ||
       document.getElementById(BADGE_ID)
     ) {
       return;
     }
+
+    badgeShownFor = location.pathname;
 
     const badge = document.createElement('div');
     badge.id = BADGE_ID;
@@ -329,8 +342,22 @@
   };
 
   // the review dialog is created on demand (and react re-creates it on every
-  // open), so watch the page and process it whenever it shows up
-  const observer = new MutationObserver(processReviewContainers);
+  // open), so watch the page and process it whenever it shows up - mutation
+  // bursts are coalesced into one scan per animation frame
+  let scanScheduled = false;
+  const scheduleScan = () => {
+    if (scanScheduled) {
+      return;
+    }
+    scanScheduled = true;
+    requestAnimationFrame(() => {
+      scanScheduled = false;
+      processReviewContainers();
+      showActiveBadge();
+    });
+  };
+
+  const observer = new MutationObserver(scheduleScan);
   observer.observe(document.body, { childList: true, subtree: true });
 
   // capture-phase listeners on document survive github's soft navigation
