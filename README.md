@@ -12,12 +12,15 @@ Misc Userscripts
 2. Get information or install:
    - Install a script directly from GitHub by clicking on the "install" link in the table below.
 
-| Userscript Wiki               |   Direct Install   |  Created   |  Updated   |
-| ----------------------------- | :----------------: | :--------: | :--------: |
-| [CloudWatch Helper][cwh-wiki] | [install][cwh-raw] | 30.03.2021 | 13.12.2021 |
+| Userscript Wiki                       |   Direct Install    |  Created   |  Updated   |
+| ------------------------------------- | :-----------------: | :--------: | :--------: |
+| [CloudWatch Helper][cwh-wiki]         | [install][cwh-raw]  | 30.03.2021 | 13.12.2021 |
+| [GitHub PR Approve Helper][gpah-wiki] | [install][gpah-raw] | 04.08.2026 | 04.08.2026 |
 
 [cwh-wiki]: https://github.com/MishaKav/userscripts/wiki/CloudWatch-Helper
 [cwh-raw]: https://raw.githubusercontent.com/MishaKav/userscripts/main/cloudwatch-helper.user.js
+[gpah-wiki]: https://github.com/MishaKav/userscripts/wiki/GitHub-PR-Approve-Helper
+[gpah-raw]: https://raw.githubusercontent.com/MishaKav/userscripts/main/github-pr-approve-helper.user.js
 
 ## Updating
 
