@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.2.0
+// @version      1.3.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -39,6 +39,10 @@
   // marker for text we inserted, so we never delete anything the user typed
   const AUTO_FILL_ATTRIBUTE = 'data-approve-helper-text';
 
+  // marker for dialogs we already processed, so the "approve pre-selected on
+  // open" fill happens once per open and never fights the user
+  const SEEN_ATTRIBUTE = 'data-approve-helper-seen';
+
   const DROPDOWN_ID = 'gpah-comment-select';
   const RANDOM_OPTION_VALUE = '__random__';
 
@@ -69,7 +73,7 @@
     );
 
   const isReviewRadio = (el) =>
-    el.matches?.('input[type="radio"]') &&
+    el?.matches?.('input[type="radio"]') &&
     (REVIEW_RADIO_NAMES.includes(el.name) ||
       /^(approve|comment|reject|request[ _-]?changes)$/i.test(el.value));
 
@@ -124,15 +128,8 @@
     console.log('[GitHub PR Approve Helper] cleared auto comment');
   };
 
-  const onReviewOptionChange = (event) => {
-    const radio = event.target;
-
-    if (
-      !isPullRequestPage() ||
-      !isAllowedOrgPage() ||
-      !isReviewRadio(radio) ||
-      !radio.checked
-    ) {
+  const handleReviewRadio = (radio) => {
+    if (!radio.checked) {
       return;
     }
 
@@ -148,6 +145,44 @@
     } else {
       clearAutoComment(textarea);
     }
+  };
+
+  // use composedPath so the real target is found even inside shadow dom
+  const getEventTarget = (event) => {
+    const target = event.composedPath?.()[0] ?? event.target;
+    return target instanceof Element ? target : null;
+  };
+
+  const onReviewOptionChange = (event) => {
+    if (!isPullRequestPage() || !isAllowedOrgPage()) {
+      return;
+    }
+
+    const radio = getEventTarget(event);
+
+    if (isReviewRadio(radio)) {
+      handleReviewRadio(radio);
+    }
+  };
+
+  // fallback for clicks that don't produce a change event, e.g. clicking the
+  // approve option when it's already selected, or clicking its label
+  const onReviewOptionClick = (event) => {
+    if (!isPullRequestPage() || !isAllowedOrgPage()) {
+      return;
+    }
+
+    const target = getEventTarget(event);
+    const radio = target?.matches?.('input[type="radio"]')
+      ? target
+      : target?.closest('label')?.control;
+
+    if (!isReviewRadio(radio)) {
+      return;
+    }
+
+    // let the browser/react finish updating the checked state first
+    setTimeout(() => handleReviewRadio(radio), 0);
   };
 
   const createCommentDropdown = () => {
@@ -192,7 +227,7 @@
     return select;
   };
 
-  const injectCommentDropdowns = () => {
+  const processReviewContainers = () => {
     if (!isPullRequestPage() || !isAllowedOrgPage()) {
       return;
     }
@@ -201,25 +236,39 @@
 
     for (const container of containers) {
       // only real review dialogs (they contain the approve/comment radios)
-      const isReviewDialog = container.querySelector(SELECTORS.REVIEW_RADIOS);
-      const textarea = isReviewDialog && getReviewTextarea(container);
+      const radios = [...container.querySelectorAll(SELECTORS.REVIEW_RADIOS)];
+      const textarea = radios.length > 0 && getReviewTextarea(container);
 
-      if (!textarea || container.querySelector(`#${DROPDOWN_ID}`)) {
+      if (!textarea) {
         continue;
       }
 
-      textarea.before(createCommentDropdown());
+      if (!container.querySelector(`#${DROPDOWN_ID}`)) {
+        textarea.before(createCommentDropdown());
+        console.log('[GitHub PR Approve Helper] review dialog found, dropdown added');
+      }
+
+      // the dialog can open with approve already pre-selected (github
+      // remembers the last choice), which fires no change event - fill once
+      if (!container.hasAttribute(SEEN_ATTRIBUTE)) {
+        container.setAttribute(SEEN_ATTRIBUTE, 'true');
+
+        if (radios.find(isApprove)?.checked) {
+          fillComment(textarea);
+        }
+      }
     }
   };
 
   // the review dialog is created on demand (and react re-creates it on every
-  // open), so watch the page and add the dropdown whenever it shows up
-  const observer = new MutationObserver(injectCommentDropdowns);
+  // open), so watch the page and process it whenever it shows up
+  const observer = new MutationObserver(processReviewContainers);
   observer.observe(document.body, { childList: true, subtree: true });
 
-  // capture-phase listener on document survives github's soft navigation
+  // capture-phase listeners on document survive github's soft navigation
   // and the review dialog being re-created every time it opens
   document.addEventListener('change', onReviewOptionChange, true);
-  injectCommentDropdowns();
+  document.addEventListener('click', onReviewOptionClick, true);
+  processReviewContainers();
   console.log('[GitHub PR Approve Helper] ready');
 })();
