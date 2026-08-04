@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.3.0
+// @version      1.3.1
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -43,7 +43,12 @@
   // open" fill happens once per open and never fights the user
   const SEEN_ATTRIBUTE = 'data-approve-helper-seen';
 
+  // flash a small badge on PR pages, so it's visible the script is running
+  // without opening devtools - set to false to disable
+  const SHOW_ACTIVE_BADGE = true;
+
   const DROPDOWN_ID = 'gpah-comment-select';
+  const BADGE_ID = 'gpah-active-badge';
   const RANDOM_OPTION_VALUE = '__random__';
 
   // 'pull_request_review[event]' - legacy "Review changes" dropdown
@@ -227,6 +232,37 @@
     return select;
   };
 
+  const showActiveBadge = () => {
+    if (
+      !SHOW_ACTIVE_BADGE ||
+      !isPullRequestPage() ||
+      !isAllowedOrgPage() ||
+      document.getElementById(BADGE_ID)
+    ) {
+      return;
+    }
+
+    const badge = document.createElement('div');
+    badge.id = BADGE_ID;
+    badge.textContent = '✅ Approve Helper active';
+    badge.style.cssText = [
+      'position: fixed',
+      'bottom: 16px',
+      'right: 16px',
+      'padding: 6px 12px',
+      'background: #1f883d',
+      'color: #fff',
+      'font: 12px -apple-system, sans-serif',
+      'border-radius: 6px',
+      'box-shadow: 0 3px 12px rgba(0, 0, 0, 0.3)',
+      'pointer-events: none',
+      'z-index: 2147483647',
+    ].join(';');
+
+    document.body.appendChild(badge);
+    setTimeout(() => badge.remove(), 2500);
+  };
+
   const processReviewContainers = () => {
     if (!isPullRequestPage() || !isAllowedOrgPage()) {
       return;
@@ -270,5 +306,6 @@
   document.addEventListener('change', onReviewOptionChange, true);
   document.addEventListener('click', onReviewOptionClick, true);
   processReviewContainers();
+  showActiveBadge();
   console.log('[GitHub PR Approve Helper] ready');
 })();
