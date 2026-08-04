@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.0.0
+// @version      1.1.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,6 +19,11 @@
 
   // one of these is picked randomly on every approve, add/remove as you like
   const APPROVE_COMMENTS = ['LGTM', 'LGTM 👍', 'Looks good to me!'];
+
+  // the script only fills comments on PRs of these orgs/users, add as you like
+  // (kept as a runtime check instead of @match, so it survives github's
+  // soft navigation between orgs)
+  const ALLOWED_ORGS = ['linear-b'];
 
   // marker for text we inserted, so we never delete anything the user typed
   const AUTO_FILL_ATTRIBUTE = 'data-approve-helper-text';
@@ -40,6 +45,11 @@
   };
 
   const isPullRequestPage = () => /\/pull\/\d+/.test(location.pathname);
+
+  const isAllowedOrgPage = () =>
+    ALLOWED_ORGS.some((org) =>
+      location.pathname.toLowerCase().startsWith(`/${org.toLowerCase()}/`),
+    );
 
   const isReviewRadio = (el) =>
     el.matches?.('input[type="radio"]') &&
@@ -100,7 +110,12 @@
   const onReviewOptionChange = (event) => {
     const radio = event.target;
 
-    if (!isPullRequestPage() || !isReviewRadio(radio) || !radio.checked) {
+    if (
+      !isPullRequestPage() ||
+      !isAllowedOrgPage() ||
+      !isReviewRadio(radio) ||
+      !radio.checked
+    ) {
       return;
     }
 
