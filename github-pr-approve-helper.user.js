@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.5.0
+// @version      1.0.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,10 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.5.0';
-
-  // verbose console logs for debugging - set to false to silence
-  const DEBUG = true;
+  const VERSION = '1.0.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -33,13 +30,9 @@
   // the alternatives offered in the dropdown ('🎲 Random' picks one of these)
   const APPROVE_COMMENTS = [
     'LGTM',
-    'LGTM 👍',
-    'LGTM 🚀',
+    'Nice',
     'Looks good to me!',
-    'Looks great, approved ✅',
-    'Nice work! 👏',
     'Great job! 🎉',
-    'Ship it! 🚢',
     'Well done 💪',
     'Clean and simple, LGTM 🔥',
   ];
@@ -81,41 +74,6 @@
       'textarea[placeholder="Leave a comment"]', // react fallback
       'textarea', // last resort, scoped to the review container only
     ],
-  };
-
-  const debug = (...args) => DEBUG && console.log('[GPAH debug]', ...args);
-
-  // compact description of an input/textarea for the debug logs
-  const describeField = (el) => ({
-    tag: el.tagName.toLowerCase(),
-    type: el.type || null,
-    name: el.name || null,
-    value: el.tagName === 'TEXTAREA' ? `(${el.value.length} chars)` : el.value,
-    checked: el.checked ?? null,
-    id: el.id || null,
-    ariaLabel: el.getAttribute('aria-label'),
-    placeholder: el.getAttribute('placeholder'),
-  });
-
-  // dump every radio/textarea of each dialog-ish container once, so real
-  // github markup can be compared against our selectors
-  const dumpedContainers = new WeakSet();
-  const dumpContainer = (container) => {
-    if (!DEBUG || dumpedContainers.has(container)) {
-      return;
-    }
-    dumpedContainers.add(container);
-    debug(
-      `container <${container.tagName.toLowerCase()}> id="${container.id}" role="${container.getAttribute('role')}"`,
-      JSON.stringify(
-        {
-          radios: [...container.querySelectorAll('input[type="radio"]')].map(describeField),
-          textareas: [...container.querySelectorAll('textarea')].map(describeField),
-        },
-        null,
-        2,
-      ),
-    );
   };
 
   const isPullRequestPage = () => /\/pull\/\d+/.test(location.pathname);
@@ -182,7 +140,6 @@
 
   const handleReviewRadio = (radio) => {
     if (!radio.checked) {
-      debug('radio not checked, skip', describeField(radio));
       return;
     }
 
@@ -190,10 +147,6 @@
     const textarea = container && getReviewTextarea(container);
 
     if (!textarea) {
-      debug(
-        container ? 'no textarea in container, skip' : 'no container for radio, skip',
-        describeField(radio),
-      );
       return;
     }
 
@@ -217,10 +170,6 @@
 
     const radio = getEventTarget(event);
 
-    if (radio?.matches?.('input[type="radio"]')) {
-      debug('change on radio', describeField(radio), isReviewRadio(radio) ? 'IS review radio' : 'NOT review radio');
-    }
-
     if (isReviewRadio(radio)) {
       handleReviewRadio(radio);
     }
@@ -237,10 +186,6 @@
     const radio = target?.matches?.('input[type="radio"]')
       ? target
       : target?.closest('label')?.control;
-
-    if (radio) {
-      debug('click resolved to radio', describeField(radio), isReviewRadio(radio) ? 'IS review radio' : 'NOT review radio');
-    }
 
     if (!isReviewRadio(radio)) {
       return;
@@ -346,8 +291,6 @@
     const containers = document.querySelectorAll(SELECTORS.REVIEW_CONTAINER);
 
     for (const container of containers) {
-      dumpContainer(container);
-
       // only real review dialogs (they contain the approve/comment radios)
       const radios = [...container.querySelectorAll(SELECTORS.REVIEW_RADIOS)];
       const textarea = radios.length > 0 && getReviewTextarea(container);
@@ -362,7 +305,6 @@
           container.style.position = 'relative';
         }
         container.appendChild(createCommentDropdown());
-        console.log('[GitHub PR Approve Helper] review dialog found, dropdown added');
       }
 
       // once per dialog open: select approve (github opens with the last
@@ -376,7 +318,6 @@
         }
 
         if (AUTO_SELECT_APPROVE && !approveRadio.checked) {
-          debug('auto-selecting approve');
           approveRadio.click();
         }
 
