@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.2.0
+// @version      1.3.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -396,6 +396,95 @@
     }
   };
 
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const waitFor = async (getter, timeout) => {
+    const deadline = performance.now() + timeout;
+    for (;;) {
+      const value = getter();
+      if (value) {
+        return value;
+      }
+      if (performance.now() > deadline) {
+        return null;
+      }
+      await sleep(150);
+    }
+  };
+
+  // fallback that needs no endpoint internals: drive github's own ui - open
+  // the review dialog, set the comment and click its submit button
+  const submitViaUi = async (comment) => {
+    const pr = parsePrPath();
+
+    const findOpener = () =>
+      [...document.querySelectorAll('button, summary')].find(
+        (el) =>
+          !el.closest(SELECTORS.REVIEW_CONTAINER) &&
+          /^submit review/i.test(el.textContent.trim()),
+      );
+
+    let opener = findOpener();
+
+    // the conversation tab has no submit review button - go to files changed
+    if (!opener) {
+      const filesTab = document.querySelector(
+        `a[href*="/pull/${pr.number}/changes"], a[href*="/pull/${pr.number}/files"]`,
+      );
+      filesTab?.click();
+      opener = await waitFor(findOpener, 10000);
+    }
+
+    if (!opener) {
+      throw new Error('submit review button not found on the page');
+    }
+
+    opener.click();
+
+    const container = await waitFor(
+      () =>
+        [...document.querySelectorAll(SELECTORS.REVIEW_CONTAINER)].find(
+          (el) => el.querySelector(SELECTORS.REVIEW_RADIOS) && getReviewTextarea(el),
+        ) ?? null,
+      5000,
+    );
+
+    if (!container) {
+      throw new Error('review dialog did not open');
+    }
+
+    const approveRadio = [
+      ...container.querySelectorAll(SELECTORS.REVIEW_RADIOS),
+    ].find(isApprove);
+
+    if (approveRadio && !approveRadio.checked) {
+      approveRadio.click();
+    }
+
+    const textarea = getReviewTextarea(container);
+    setNativeValue(textarea, comment);
+    textarea.setAttribute(AUTO_FILL_ATTRIBUTE, comment);
+    await sleep(200);
+
+    const submitButton =
+      [...container.querySelectorAll('button')].find((el) =>
+        /submit review/i.test(el.textContent),
+      ) ?? container.querySelector('[type="submit"]');
+
+    if (!submitButton) {
+      throw new Error('submit button not found in the review dialog');
+    }
+
+    await waitFor(() => !submitButton.disabled, 3000);
+    submitButton.click();
+
+    // the dialog going away is the sign the review was submitted
+    const closed = await waitFor(() => !document.contains(container), 8000);
+    if (!closed) {
+      throw new Error('review dialog did not close after submit');
+    }
+  };
+
   // PRs approved through the button this session, so it doesn't re-appear
   const approvedPrs = new Set();
 
@@ -420,7 +509,14 @@
     setButtonState(button, '⏳ Approving…', '#9a6700');
 
     try {
-      await submitApproval(comment);
+      try {
+        await submitApproval(comment);
+      } catch (directError) {
+        console.log(
+          `[GitHub PR Approve Helper] direct approve failed (${directError.message}), driving the ui instead`,
+        );
+        await submitViaUi(comment);
+      }
       approvedPrs.add(prKey(pr));
       setButtonState(button, '🎉 Approved', '#1f883d');
       console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)}: "${comment}"`);
