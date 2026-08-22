@@ -15,7 +15,7 @@ Misc Userscripts
 | Userscript Wiki                       |   Direct Install    |  Created   |  Updated   |
 | ------------------------------------- | :-----------------: | :--------: | :--------: |
 | [CloudWatch Helper][cwh-wiki]         | [install][cwh-raw]  | 30.03.2021 | 13.12.2021 |
-| [GitHub PR Approve Helper][gpah-wiki] | [install][gpah-raw] | 04.08.2026 | 04.08.2026 |
+| [GitHub PR Approve Helper][gpah-wiki] | [install][gpah-raw] | 04.08.2026 | 22.08.2026 |
 
 [cwh-wiki]: https://github.com/MishaKav/userscripts/wiki/CloudWatch-Helper
 [cwh-raw]: https://raw.githubusercontent.com/MishaKav/userscripts/main/cloudwatch-helper.user.js

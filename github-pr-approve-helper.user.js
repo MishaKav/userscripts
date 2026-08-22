@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.0.0
+// @version      1.1.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -49,12 +49,13 @@
   // open" fill happens once per open and never fights the user
   const SEEN_ATTRIBUTE = 'data-approve-helper-seen';
 
-  // flash a small badge on PR pages, so it's visible the script is running
-  // without opening devtools - set to false to disable
-  const SHOW_ACTIVE_BADGE = true;
+  // show a floating quick-approve button on PR pages - click it to pick a
+  // comment and approve the PR without opening the review dialog
+  const SHOW_QUICK_APPROVE = true;
 
   const DROPDOWN_ID = 'gpah-comment-select';
-  const BADGE_ID = 'gpah-active-badge';
+  const BUTTON_ID = 'gpah-quick-approve';
+  const MENU_ID = 'gpah-quick-approve-menu';
   const RANDOM_OPTION_VALUE = '__random__';
 
   // 'pull_request_review[event]' - legacy "Review changes" dropdown
@@ -76,7 +77,14 @@
     ],
   };
 
-  const isPullRequestPage = () => /\/pull\/\d+/.test(location.pathname);
+  const parsePrPath = () => {
+    const match = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+    return match && { owner: match[1], repo: match[2], number: match[3] };
+  };
+
+  const prKey = (pr) => `${pr.owner}/${pr.repo}#${pr.number}`;
+
+  const isPullRequestPage = () => Boolean(parsePrPath());
 
   const isAllowedOrgPage = () =>
     ALLOWED_ORGS.some((org) =>
@@ -259,41 +267,180 @@
     return select;
   };
 
-  // shown once per page/soft-navigation, tracked by pathname
-  let badgeShownFor = null;
+  // ===== QUICK APPROVE =====
 
-  const showActiveBadge = () => {
-    if (
-      !SHOW_ACTIVE_BADGE ||
-      !isPullRequestPage() ||
-      !isAllowedOrgPage() ||
-      badgeShownFor === location.pathname ||
-      document.getElementById(BADGE_ID)
-    ) {
+  // approve the PR the same way github's own review form does: load the
+  // files page with the session cookies, take the fresh csrf token from the
+  // review form and post the approve to the form's endpoint
+  const submitApproval = async (comment) => {
+    const pr = parsePrPath();
+    const filesUrl = `/${pr.owner}/${pr.repo}/pull/${pr.number}/files`;
+
+    const filesResponse = await fetch(filesUrl, { credentials: 'include' });
+    if (!filesResponse.ok) {
+      throw new Error(`review form page failed to load (${filesResponse.status})`);
+    }
+
+    const doc = new DOMParser().parseFromString(
+      await filesResponse.text(),
+      'text/html',
+    );
+    const form = doc.querySelector('form[action$="/reviews"]');
+    const token = form?.querySelector('input[name="authenticity_token"]')?.value;
+
+    if (!token) {
+      throw new Error('review form / csrf token not found on the files page');
+    }
+
+    const submitResponse = await fetch(
+      new URL(form.getAttribute('action'), location.origin),
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        body: new URLSearchParams({
+          authenticity_token: token,
+          'pull_request_review[event]': 'approve',
+          'pull_request_review[body]': comment,
+        }),
+      },
+    );
+
+    if (!submitResponse.ok) {
+      throw new Error(`approve request failed (${submitResponse.status})`);
+    }
+  };
+
+  // PRs approved through the button this session, so it doesn't re-appear
+  const approvedPrs = new Set();
+
+  const setButtonState = (button, text, background) => {
+    button.textContent = text;
+    button.style.background = background;
+  };
+
+  const closeQuickApproveMenu = () =>
+    document.getElementById(MENU_ID)?.remove();
+
+  const onQuickApprove = async (comment) => {
+    closeQuickApproveMenu();
+    const button = document.getElementById(BUTTON_ID);
+    const pr = parsePrPath();
+
+    if (!button || !pr) {
       return;
     }
 
-    badgeShownFor = location.pathname;
+    button.disabled = true;
+    setButtonState(button, '⏳ Approving…', '#9a6700');
 
-    const badge = document.createElement('div');
-    badge.id = BADGE_ID;
-    badge.textContent = `✅ Approve Helper v${VERSION} active`;
-    badge.style.cssText = [
-      'position: fixed',
-      'bottom: 16px',
-      'right: 16px',
-      'padding: 6px 12px',
-      'background: #1f883d',
-      'color: #fff',
-      'font: 12px -apple-system, sans-serif',
+    try {
+      await submitApproval(comment);
+      approvedPrs.add(prKey(pr));
+      setButtonState(button, '🎉 Approved', '#1f883d');
+      console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)}: "${comment}"`);
+      setTimeout(() => button.remove(), 4000);
+    } catch (error) {
+      setButtonState(button, '❌ Approve failed - see console', '#cf222e');
+      button.disabled = false;
+      console.log(`[GitHub PR Approve Helper] quick approve failed: ${error.message}`);
+      setTimeout(() => setButtonState(button, '✅ Quick approve', '#1f883d'), 4000);
+    }
+  };
+
+  const createMenuRow = (text, onClick, muted = false) => {
+    const row = document.createElement('div');
+    row.textContent = text;
+    row.style.cssText = [
+      'padding: 6px 10px',
       'border-radius: 6px',
-      'box-shadow: 0 3px 12px rgba(0, 0, 0, 0.3)',
-      'pointer-events: none',
+      'cursor: pointer',
+      `color: ${muted ? '#656d76' : 'inherit'}`,
+    ].join(';');
+    row.addEventListener('mouseenter', () => (row.style.background = '#f6f8fa'));
+    row.addEventListener('mouseleave', () => (row.style.background = ''));
+    row.addEventListener('click', onClick);
+    return row;
+  };
+
+  const toggleQuickApproveMenu = () => {
+    if (document.getElementById(MENU_ID)) {
+      closeQuickApproveMenu();
+      return;
+    }
+
+    const menu = document.createElement('div');
+    menu.id = MENU_ID;
+    menu.style.cssText = [
+      'position: fixed',
+      'bottom: 56px',
+      'right: 16px',
+      'min-width: 220px',
+      'padding: 4px',
+      'background: #fff',
+      'color: #1f2328',
+      'font: 13px -apple-system, sans-serif',
+      'border: 1px solid #d0d7de',
+      'border-radius: 8px',
+      'box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2)',
       'z-index: 2147483647',
     ].join(';');
 
-    document.body.appendChild(badge);
-    setTimeout(() => badge.remove(), 2500);
+    const comments = [
+      DEFAULT_COMMENT,
+      ...APPROVE_COMMENTS.filter((comment) => comment !== DEFAULT_COMMENT),
+    ];
+
+    for (const comment of comments) {
+      menu.appendChild(createMenuRow(`✅ ${comment}`, () => onQuickApprove(comment)));
+    }
+    menu.appendChild(createMenuRow('Cancel', closeQuickApproveMenu, true));
+
+    document.body.appendChild(menu);
+  };
+
+  const ensureQuickApproveButton = () => {
+    const pr = parsePrPath();
+    const existing = document.getElementById(BUTTON_ID);
+    const wanted =
+      SHOW_QUICK_APPROVE && pr && isAllowedOrgPage() && !approvedPrs.has(prKey(pr));
+
+    if (!wanted) {
+      // a disabled button is approving or showing its result - it removes
+      // itself via its own timeout, don't yank it mid-feedback
+      if (existing && !existing.disabled) {
+        existing.remove();
+        closeQuickApproveMenu();
+      }
+      return;
+    }
+
+    if (existing) {
+      return;
+    }
+
+    const button = document.createElement('button');
+    button.id = BUTTON_ID;
+    button.type = 'button';
+    button.textContent = '✅ Quick approve';
+    button.title = `Approve Helper v${VERSION} - approve this PR without opening the review dialog`;
+    button.style.cssText = [
+      'position: fixed',
+      'bottom: 16px',
+      'right: 16px',
+      'padding: 8px 14px',
+      'background: #1f883d',
+      'color: #fff',
+      'font: 600 12px -apple-system, sans-serif',
+      'border: none',
+      'border-radius: 6px',
+      'box-shadow: 0 3px 12px rgba(0, 0, 0, 0.3)',
+      'cursor: pointer',
+      'z-index: 2147483647',
+    ].join(';');
+    button.addEventListener('click', toggleQuickApproveMenu);
+
+    document.body.appendChild(button);
   };
 
   const processReviewContainers = () => {
@@ -353,7 +500,7 @@
     requestAnimationFrame(() => {
       scanScheduled = false;
       processReviewContainers();
-      showActiveBadge();
+      ensureQuickApproveButton();
     });
   };
 
@@ -364,7 +511,24 @@
   // and the review dialog being re-created every time it opens
   document.addEventListener('change', onReviewOptionChange, true);
   document.addEventListener('click', onReviewOptionClick, true);
+
+  // close the quick-approve menu on a click elsewhere or on escape
+  document.addEventListener(
+    'click',
+    (event) => {
+      if (!getEventTarget(event)?.closest?.(`#${MENU_ID}, #${BUTTON_ID}`)) {
+        closeQuickApproveMenu();
+      }
+    },
+    true,
+  );
+  document.addEventListener(
+    'keydown',
+    (event) => event.key === 'Escape' && closeQuickApproveMenu(),
+    true,
+  );
+
   processReviewContainers();
-  showActiveBadge();
+  ensureQuickApproveButton();
   console.log(`[GitHub PR Approve Helper] v${VERSION} ready on ${location.href}`);
 })();
