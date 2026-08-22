@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.0.0
+// @version      1.1.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -49,12 +49,17 @@
   // open" fill happens once per open and never fights the user
   const SEEN_ATTRIBUTE = 'data-approve-helper-seen';
 
-  // flash a small badge on PR pages, so it's visible the script is running
-  // without opening devtools - set to false to disable
-  const SHOW_ACTIVE_BADGE = true;
+  // show a floating quick-approve button on PR pages - click it to pick a
+  // comment and approve the PR without opening the review dialog
+  const SHOW_QUICK_APPROVE = true;
 
   const DROPDOWN_ID = 'gpah-comment-select';
-  const BADGE_ID = 'gpah-active-badge';
+  const BUTTON_ID = 'gpah-quick-approve';
+  const MENU_ID = 'gpah-quick-approve-menu';
+
+  // set while the quick-approve button is busy or showing its result, so
+  // the page scan leaves it alone until it returns to idle
+  const BUTTON_STATE_ATTRIBUTE = 'data-gpah-state';
   const RANDOM_OPTION_VALUE = '__random__';
 
   // 'pull_request_review[event]' - legacy "Review changes" dropdown
@@ -76,7 +81,17 @@
     ],
   };
 
-  const isPullRequestPage = () => /\/pull\/\d+/.test(location.pathname);
+  const parsePrPath = () => {
+    const match = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+    return match && { owner: match[1], repo: match[2], number: match[3] };
+  };
+
+  const prKey = (pr) => `${pr.owner}/${pr.repo}#${pr.number}`;
+
+  const prPagePath = (pr, page) =>
+    `/${pr.owner}/${pr.repo}/pull/${pr.number}/${page}`;
+
+  const isPullRequestPage = () => Boolean(parsePrPath());
 
   const isAllowedOrgPage = () =>
     ALLOWED_ORGS.some((org) =>
@@ -90,6 +105,10 @@
 
   const isApprove = (radio) => /^approve$/i.test(radio.value);
 
+  // matches both the opener on the files page and the dialog's own submit
+  const isSubmitReviewButton = (el) =>
+    /^submit review/i.test(el.textContent.trim());
+
   const pickComment = () =>
     APPROVE_COMMENTS[Math.floor(Math.random() * APPROVE_COMMENTS.length)];
 
@@ -102,6 +121,13 @@
     }
     return null;
   };
+
+  // dialog-ish containers that are real review dialogs: they contain the
+  // approve/comment radios and a comment textarea
+  const findReviewDialogs = () =>
+    [...document.querySelectorAll(SELECTORS.REVIEW_CONTAINER)].filter(
+      (el) => el.querySelector(SELECTORS.REVIEW_RADIOS) && getReviewTextarea(el),
+    );
 
   // react-controlled textarea ignores a plain `.value =`, so assign through
   // the native prototype setter and fire bubbled events for react to notice
@@ -121,14 +147,20 @@
     textarea.dispatchEvent(new Event('change', { bubbles: true }));
   };
 
+  // set the text and mark it as ours - clearAutoComment only removes text
+  // that still exactly matches this marker
+  const insertAutoComment = (textarea, text) => {
+    setNativeValue(textarea, text);
+    textarea.setAttribute(AUTO_FILL_ATTRIBUTE, text);
+  };
+
   const fillComment = (textarea) => {
     // never overwrite anything the user already typed
     if (textarea.value.trim() !== '') {
       return;
     }
 
-    setNativeValue(textarea, DEFAULT_COMMENT);
-    textarea.setAttribute(AUTO_FILL_ATTRIBUTE, DEFAULT_COMMENT);
+    insertAutoComment(textarea, DEFAULT_COMMENT);
     console.log(`[GitHub PR Approve Helper] filled review comment: "${DEFAULT_COMMENT}"`);
   };
 
@@ -250,8 +282,7 @@
       }
 
       // explicit pick from the dropdown replaces whatever is in the box
-      setNativeValue(textarea, comment);
-      textarea.setAttribute(AUTO_FILL_ATTRIBUTE, comment);
+      insertAutoComment(textarea, comment);
       textarea.focus();
       console.log(`[GitHub PR Approve Helper] inserted comment: "${comment}"`);
     });
@@ -259,41 +290,400 @@
     return select;
   };
 
-  // shown once per page/soft-navigation, tracked by pathname
-  let badgeShownFor = null;
+  // ===== QUICK APPROVE =====
 
-  const showActiveBadge = () => {
-    if (
-      !SHOW_ACTIVE_BADGE ||
-      !isPullRequestPage() ||
-      !isAllowedOrgPage() ||
-      badgeShownFor === location.pathname ||
-      document.getElementById(BADGE_ID)
-    ) {
+  const safeJsonParse = (text) => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+
+  // walk a parsed react payload for a `csrf_tokens: {path: {method: token}}`
+  // object, the way the new github ui embeds its csrf tokens
+  const findCsrfTokensMap = (node) => {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+    if (node.csrf_tokens && typeof node.csrf_tokens === 'object') {
+      return node.csrf_tokens;
+    }
+    for (const value of Object.values(node)) {
+      const found = findCsrfTokensMap(value);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  };
+
+  // the failure diagnostic keeps at most this many token paths, so a huge
+  // csrf_tokens map can't flood the console on every fallback
+  const MAX_DIAGNOSTIC_PATHS = 20;
+
+  // scan one document for a review csrf token, in every known place github
+  // puts one: the legacy review form, then the csrf_tokens maps embedded in
+  // the json payloads of the new react pages. also returns what was
+  // searched (a count and a bounded sample of paths, never token values),
+  // so the failure diagnostic always describes the actual search
+  const scanForReviewToken = (doc, pr) => {
+    const scripts = [...doc.querySelectorAll('script[type="application/json"]')];
+    const stats = {
+      jsonScripts: scripts.length,
+      reviewForms: doc.querySelectorAll('form[action$="/reviews"]').length,
+      csrfTokenPathCount: 0,
+      csrfTokenPaths: [],
+    };
+
+    // only accept a form that belongs to THIS pr - a stale form from a
+    // previous soft navigation must not approve the wrong pr
+    const form = doc.querySelector(
+      `form[action$="/pull/${pr.number}/reviews"]`,
+    );
+    const formToken = form?.querySelector(
+      'input[name="authenticity_token"]',
+    )?.value;
+
+    if (formToken) {
+      return {
+        found: { token: formToken, path: form.getAttribute('action') },
+        stats,
+      };
+    }
+
+    for (const script of scripts) {
+      // github embeds huge page payloads in these scripts - skip the json
+      // parse and walk for the ones that can't contain a csrf_tokens map
+      if (!script.textContent.includes('csrf_tokens')) {
+        continue;
+      }
+
+      const map = findCsrfTokensMap(safeJsonParse(script.textContent));
+      if (!map) {
+        continue;
+      }
+
+      const paths = Object.keys(map);
+      stats.csrfTokenPathCount += paths.length;
+      stats.csrfTokenPaths.push(
+        ...paths.slice(
+          0,
+          Math.max(0, MAX_DIAGNOSTIC_PATHS - stats.csrfTokenPaths.length),
+        ),
+      );
+
+      const entry = Object.entries(map).find(([path]) =>
+        path.endsWith(`/pull/${pr.number}/reviews`),
+      );
+
+      if (entry) {
+        const [path, tokens] = entry;
+        const token = tokens?.post ?? Object.values(tokens ?? {})[0];
+        if (token) {
+          return { found: { token, path }, stats };
+        }
+      }
+    }
+
+    return { found: null, stats };
+  };
+
+  // approve the PR the same way github's own ui does: find a fresh csrf
+  // token (on the live page, or on the fetched files page) and post the
+  // approve to the reviews endpoint with the session cookies
+  const submitApproval = async (comment, pr) => {
+    // the page we're already on may embed the token
+    const liveScan = scanForReviewToken(document, pr);
+    let filesScan = null;
+    let found = liveScan.found;
+
+    if (!found) {
+      const filesResponse = await fetch(prPagePath(pr, 'files'), {
+        credentials: 'include',
+      });
+
+      if (!filesResponse.ok) {
+        throw new Error(`review form page failed to load (${filesResponse.status})`);
+      }
+
+      const filesDoc = new DOMParser().parseFromString(
+        await filesResponse.text(),
+        'text/html',
+      );
+      filesScan = scanForReviewToken(filesDoc, pr);
+      found = filesScan.found;
+    }
+
+    if (!found) {
+      console.log(
+        '[GitHub PR Approve Helper] csrf discovery details:',
+        JSON.stringify({
+          livePage: liveScan.stats,
+          filesPage: filesScan?.stats ?? null,
+        }),
+      );
+      throw new Error(
+        'no csrf token found - paste the "csrf discovery details" console line to debug',
+      );
+    }
+
+    const submitResponse = await fetch(new URL(found.path, location.origin), {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      body: new URLSearchParams({
+        authenticity_token: found.token,
+        'pull_request_review[event]': 'approve',
+        'pull_request_review[body]': comment,
+      }),
+    });
+
+    if (!submitResponse.ok) {
+      throw new Error(`approve request failed (${submitResponse.status})`);
+    }
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const waitFor = async (getter, timeout) => {
+    const deadline = performance.now() + timeout;
+    for (;;) {
+      const value = getter();
+      if (value) {
+        return value;
+      }
+      if (performance.now() > deadline) {
+        return null;
+      }
+      await sleep(150);
+    }
+  };
+
+  // fallback that needs no endpoint internals: drive github's own ui - open
+  // the review dialog, set the comment and click its submit button
+  const submitViaUi = async (comment, pr) => {
+    const findOpener = () =>
+      [...document.querySelectorAll('button, summary')].find(
+        (el) =>
+          isSubmitReviewButton(el) && !el.closest(SELECTORS.REVIEW_CONTAINER),
+      );
+
+    let opener = findOpener();
+
+    // the conversation tab has no submit review button - go to files changed
+    if (!opener) {
+      const filesTab = document.querySelector(
+        `a[href*="${prPagePath(pr, 'changes')}"], a[href*="${prPagePath(pr, 'files')}"]`,
+      );
+      filesTab?.click();
+      opener = await waitFor(findOpener, 10000);
+    }
+
+    if (!opener) {
+      throw new Error('submit review button not found on the page');
+    }
+
+    opener.click();
+
+    const container = await waitFor(() => findReviewDialogs()[0], 5000);
+
+    if (!container) {
+      throw new Error('review dialog did not open');
+    }
+
+    const approveRadio = [
+      ...container.querySelectorAll(SELECTORS.REVIEW_RADIOS),
+    ].find(isApprove);
+
+    if (approveRadio && !approveRadio.checked) {
+      approveRadio.click();
+    }
+
+    insertAutoComment(getReviewTextarea(container), comment);
+    await sleep(200);
+
+    const submitButton =
+      [...container.querySelectorAll('button')].find(isSubmitReviewButton) ??
+      container.querySelector('[type="submit"]');
+
+    if (!submitButton) {
+      throw new Error('submit button not found in the review dialog');
+    }
+
+    const enabled = await waitFor(() => !submitButton.disabled, 3000);
+    if (!enabled) {
+      throw new Error('submit button never became enabled');
+    }
+    submitButton.click();
+
+    // the dialog going away is the sign the review was submitted
+    const closed = await waitFor(() => !document.contains(container), 8000);
+    if (!closed) {
+      throw new Error('review dialog did not close after submit');
+    }
+  };
+
+  // PRs approved through the button this session, so it doesn't re-appear
+  const approvedPrs = new Set();
+
+  // state: 'busy' | 'done' | 'error', or null when back to idle
+  const setButtonState = (button, text, background, state) => {
+    button.textContent = text;
+    button.style.background = background;
+
+    if (state) {
+      button.setAttribute(BUTTON_STATE_ATTRIBUTE, state);
+    } else {
+      button.removeAttribute(BUTTON_STATE_ATTRIBUTE);
+    }
+  };
+
+  const closeQuickApproveMenu = () =>
+    document.getElementById(MENU_ID)?.remove();
+
+  const onQuickApprove = async (comment) => {
+    closeQuickApproveMenu();
+    const button = document.getElementById(BUTTON_ID);
+    const pr = parsePrPath();
+
+    if (!button || !pr) {
       return;
     }
 
-    badgeShownFor = location.pathname;
+    // ignore a second trigger (e.g. via the right-click menu) while an
+    // approval is in flight or its success is still showing
+    const state = button.getAttribute(BUTTON_STATE_ATTRIBUTE);
+    if (state === 'busy' || state === 'done') {
+      return;
+    }
 
-    const badge = document.createElement('div');
-    badge.id = BADGE_ID;
-    badge.textContent = `✅ Approve Helper v${VERSION} active`;
-    badge.style.cssText = [
-      'position: fixed',
-      'bottom: 16px',
-      'right: 16px',
-      'padding: 6px 12px',
-      'background: #1f883d',
-      'color: #fff',
-      'font: 12px -apple-system, sans-serif',
+    button.disabled = true;
+    setButtonState(button, '⏳ Approving…', '#9a6700', 'busy');
+
+    try {
+      try {
+        await submitApproval(comment, pr);
+      } catch (directError) {
+        console.log(
+          `[GitHub PR Approve Helper] direct approve failed (${directError.message}), driving the ui instead`,
+        );
+        await submitViaUi(comment, pr);
+      }
+      approvedPrs.add(prKey(pr));
+      setButtonState(button, '🎉 Approved', '#1f883d', 'done');
+      console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)}: "${comment}"`);
+      setTimeout(() => button.remove(), 4000);
+    } catch (error) {
+      setButtonState(button, '❌ Approve failed - see console', '#cf222e', 'error');
+      button.disabled = false;
+      console.log(`[GitHub PR Approve Helper] quick approve failed: ${error.message}`);
+      setTimeout(
+        () => setButtonState(button, '✅ Quick approve', '#1f883d', null),
+        4000,
+      );
+    }
+  };
+
+  const createMenuRow = (text, onClick, muted = false) => {
+    const row = document.createElement('div');
+    row.textContent = text;
+    row.style.cssText = [
+      'padding: 6px 10px',
       'border-radius: 6px',
-      'box-shadow: 0 3px 12px rgba(0, 0, 0, 0.3)',
-      'pointer-events: none',
+      'cursor: pointer',
+      `color: ${muted ? '#656d76' : 'inherit'}`,
+    ].join(';');
+    row.addEventListener('mouseenter', () => (row.style.background = '#f6f8fa'));
+    row.addEventListener('mouseleave', () => (row.style.background = ''));
+    row.addEventListener('click', onClick);
+    return row;
+  };
+
+  const toggleQuickApproveMenu = () => {
+    if (document.getElementById(MENU_ID)) {
+      closeQuickApproveMenu();
+      return;
+    }
+
+    const menu = document.createElement('div');
+    menu.id = MENU_ID;
+    menu.style.cssText = [
+      'position: fixed',
+      'bottom: 56px',
+      'right: 16px',
+      'min-width: 220px',
+      'padding: 4px',
+      'background: #fff',
+      'color: #1f2328',
+      'font: 13px -apple-system, sans-serif',
+      'border: 1px solid #d0d7de',
+      'border-radius: 8px',
+      'box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2)',
       'z-index: 2147483647',
     ].join(';');
 
-    document.body.appendChild(badge);
-    setTimeout(() => badge.remove(), 2500);
+    const comments = [
+      DEFAULT_COMMENT,
+      ...APPROVE_COMMENTS.filter((comment) => comment !== DEFAULT_COMMENT),
+    ];
+
+    for (const comment of comments) {
+      menu.appendChild(createMenuRow(`✅ ${comment}`, () => onQuickApprove(comment)));
+    }
+    menu.appendChild(createMenuRow('Cancel', closeQuickApproveMenu, true));
+
+    document.body.appendChild(menu);
+  };
+
+  const ensureQuickApproveButton = () => {
+    const pr = parsePrPath();
+    const existing = document.getElementById(BUTTON_ID);
+    const wanted =
+      SHOW_QUICK_APPROVE && pr && isAllowedOrgPage() && !approvedPrs.has(prKey(pr));
+
+    if (!wanted) {
+      // a button in a non-idle state is approving or showing its result -
+      // its own timeout ends that, don't yank it mid-feedback
+      if (existing && !existing.hasAttribute(BUTTON_STATE_ATTRIBUTE)) {
+        existing.remove();
+        closeQuickApproveMenu();
+      }
+      return;
+    }
+
+    if (existing) {
+      return;
+    }
+
+    const button = document.createElement('button');
+    button.id = BUTTON_ID;
+    button.type = 'button';
+    button.textContent = '✅ Quick approve';
+    button.title = `Approve Helper v${VERSION} - click: approve with ${DEFAULT_COMMENT} · right-click: choose text`;
+    button.style.cssText = [
+      'position: fixed',
+      'bottom: 16px',
+      'right: 16px',
+      'padding: 8px 14px',
+      'background: #1f883d',
+      'color: #fff',
+      'font: 600 12px -apple-system, sans-serif',
+      'border: none',
+      'border-radius: 6px',
+      'box-shadow: 0 3px 12px rgba(0, 0, 0, 0.3)',
+      'cursor: pointer',
+      'z-index: 2147483647',
+    ].join(';');
+    // click approves immediately with the default comment, right-click
+    // opens the menu to approve with a different text
+    button.addEventListener('click', () => onQuickApprove(DEFAULT_COMMENT));
+    button.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      toggleQuickApproveMenu();
+    });
+
+    document.body.appendChild(button);
   };
 
   const processReviewContainers = () => {
@@ -301,17 +691,7 @@
       return;
     }
 
-    const containers = document.querySelectorAll(SELECTORS.REVIEW_CONTAINER);
-
-    for (const container of containers) {
-      // only real review dialogs (they contain the approve/comment radios)
-      const radios = [...container.querySelectorAll(SELECTORS.REVIEW_RADIOS)];
-      const textarea = radios.length > 0 && getReviewTextarea(container);
-
-      if (!textarea) {
-        continue;
-      }
-
+    for (const container of findReviewDialogs()) {
       if (!container.querySelector(`#${DROPDOWN_ID}`)) {
         // anchor the absolutely-positioned dropdown to the dialog itself
         if (getComputedStyle(container).position === 'static') {
@@ -324,7 +704,9 @@
       // used option, and a pre-selected radio fires no change event)
       if (!container.hasAttribute(SEEN_ATTRIBUTE)) {
         container.setAttribute(SEEN_ATTRIBUTE, 'true');
-        const approveRadio = radios.find(isApprove);
+        const approveRadio = [
+          ...container.querySelectorAll(SELECTORS.REVIEW_RADIOS),
+        ].find(isApprove);
 
         if (!approveRadio) {
           continue;
@@ -335,7 +717,7 @@
         }
 
         if (approveRadio.checked) {
-          fillComment(textarea);
+          fillComment(getReviewTextarea(container));
         }
       }
     }
@@ -353,7 +735,7 @@
     requestAnimationFrame(() => {
       scanScheduled = false;
       processReviewContainers();
-      showActiveBadge();
+      ensureQuickApproveButton();
     });
   };
 
@@ -364,7 +746,47 @@
   // and the review dialog being re-created every time it opens
   document.addEventListener('change', onReviewOptionChange, true);
   document.addEventListener('click', onReviewOptionClick, true);
+
+  // close the quick-approve menu on a click elsewhere or on escape
+  document.addEventListener(
+    'click',
+    (event) => {
+      if (!getEventTarget(event)?.closest?.(`#${MENU_ID}, #${BUTTON_ID}`)) {
+        closeQuickApproveMenu();
+      }
+    },
+    true,
+  );
+  document.addEventListener(
+    'keydown',
+    (event) => event.key === 'Escape' && closeQuickApproveMenu(),
+    true,
+  );
+
+  // the legacy review dropdown stays in the dom when closed (unlike the
+  // react dialog, which unmounts): re-arm the once-per-open logic when it
+  // closes, and re-process when it opens (open/close mutates no children,
+  // so the childList observer alone won't fire)
+  document.addEventListener(
+    'toggle',
+    (event) => {
+      const details = getEventTarget(event);
+      if (!(details instanceof HTMLDetailsElement)) {
+        return;
+      }
+
+      if (details.open) {
+        scheduleScan();
+      } else {
+        for (const seen of details.querySelectorAll(`[${SEEN_ATTRIBUTE}]`)) {
+          seen.removeAttribute(SEEN_ATTRIBUTE);
+        }
+      }
+    },
+    true,
+  );
+
   processReviewContainers();
-  showActiveBadge();
+  ensureQuickApproveButton();
   console.log(`[GitHub PR Approve Helper] v${VERSION} ready on ${location.href}`);
 })();
