@@ -331,7 +331,11 @@
       csrfTokenPaths: [],
     };
 
-    const form = doc.querySelector('form[action$="/reviews"]');
+    // only accept a form that belongs to THIS pr - a stale form from a
+    // previous soft navigation must not approve the wrong pr
+    const form = doc.querySelector(
+      `form[action$="/pull/${pr.number}/reviews"]`,
+    );
     const formToken = form?.querySelector(
       'input[name="authenticity_token"]',
     )?.value;
@@ -356,9 +360,8 @@
       }
 
       stats.csrfTokenPaths.push(...Object.keys(map));
-      const entry = Object.entries(map).find(
-        ([path]) =>
-          path.includes(`/pull/${pr.number}`) && path.endsWith('/reviews'),
+      const entry = Object.entries(map).find(([path]) =>
+        path.endsWith(`/pull/${pr.number}/reviews`),
       );
 
       if (entry) {
@@ -529,6 +532,13 @@
     const pr = parsePrPath();
 
     if (!button || !pr) {
+      return;
+    }
+
+    // ignore a second trigger (e.g. via the right-click menu) while an
+    // approval is in flight or its success is still showing
+    const state = button.getAttribute(BUTTON_STATE_ATTRIBUTE);
+    if (state === 'busy' || state === 'done') {
       return;
     }
 
@@ -734,6 +744,29 @@
   document.addEventListener(
     'keydown',
     (event) => event.key === 'Escape' && closeQuickApproveMenu(),
+    true,
+  );
+
+  // the legacy review dropdown stays in the dom when closed (unlike the
+  // react dialog, which unmounts): re-arm the once-per-open logic when it
+  // closes, and re-process when it opens (open/close mutates no children,
+  // so the childList observer alone won't fire)
+  document.addEventListener(
+    'toggle',
+    (event) => {
+      const details = getEventTarget(event);
+      if (!(details instanceof HTMLDetailsElement)) {
+        return;
+      }
+
+      if (details.open) {
+        scheduleScan();
+      } else {
+        for (const seen of details.querySelectorAll(`[${SEEN_ATTRIBUTE}]`)) {
+          seen.removeAttribute(SEEN_ATTRIBUTE);
+        }
+      }
+    },
     true,
   );
 
