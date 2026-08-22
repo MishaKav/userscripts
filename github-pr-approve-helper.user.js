@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.1.0
+// @version      1.2.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -269,42 +269,127 @@
 
   // ===== QUICK APPROVE =====
 
-  // approve the PR the same way github's own review form does: load the
-  // files page with the session cookies, take the fresh csrf token from the
-  // review form and post the approve to the form's endpoint
+  const safeJsonParse = (text) => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+
+  // walk a parsed react payload for a `csrf_tokens: {path: {method: token}}`
+  // object, the way the new github ui embeds its csrf tokens
+  const findCsrfTokensMap = (node) => {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+    if (node.csrf_tokens && typeof node.csrf_tokens === 'object') {
+      return node.csrf_tokens;
+    }
+    for (const value of Object.values(node)) {
+      const found = findCsrfTokensMap(value);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  };
+
+  // find a csrf token for the review submit in a document, trying every
+  // known place github puts one: the legacy review form, then the
+  // csrf_tokens map embedded in the json payloads of the new react pages
+  const findReviewToken = (doc, pr) => {
+    const form = doc.querySelector('form[action$="/reviews"]');
+    const formToken = form?.querySelector(
+      'input[name="authenticity_token"]',
+    )?.value;
+
+    if (formToken) {
+      return { token: formToken, path: form.getAttribute('action') };
+    }
+
+    for (const script of doc.querySelectorAll('script[type="application/json"]')) {
+      const map = findCsrfTokensMap(safeJsonParse(script.textContent));
+      const entry =
+        map &&
+        Object.entries(map).find(
+          ([path]) =>
+            path.includes(`/pull/${pr.number}`) && path.endsWith('/reviews'),
+        );
+
+      if (entry) {
+        const [path, tokens] = entry;
+        const token = tokens?.post ?? Object.values(tokens ?? {})[0];
+        if (token) {
+          return { token, path };
+        }
+      }
+    }
+
+    return null;
+  };
+
+  // what was searched, for the console diagnostic when no token is found
+  // (paths only, never token values)
+  const describeTokenSearch = (doc) => {
+    const scripts = [...doc.querySelectorAll('script[type="application/json"]')];
+    return {
+      jsonScripts: scripts.length,
+      reviewForms: doc.querySelectorAll('form[action$="/reviews"]').length,
+      csrfTokenPaths: scripts.flatMap((script) =>
+        Object.keys(findCsrfTokensMap(safeJsonParse(script.textContent)) ?? {}),
+      ),
+    };
+  };
+
+  // approve the PR the same way github's own ui does: find a fresh csrf
+  // token (on the live page, or on the fetched files page) and post the
+  // approve to the reviews endpoint with the session cookies
   const submitApproval = async (comment) => {
     const pr = parsePrPath();
-    const filesUrl = `/${pr.owner}/${pr.repo}/pull/${pr.number}/files`;
 
-    const filesResponse = await fetch(filesUrl, { credentials: 'include' });
-    if (!filesResponse.ok) {
-      throw new Error(`review form page failed to load (${filesResponse.status})`);
+    // the page we're already on may embed the token
+    let found = findReviewToken(document, pr);
+    let filesDoc = null;
+
+    if (!found) {
+      const filesUrl = `/${pr.owner}/${pr.repo}/pull/${pr.number}/files`;
+      const filesResponse = await fetch(filesUrl, { credentials: 'include' });
+
+      if (!filesResponse.ok) {
+        throw new Error(`review form page failed to load (${filesResponse.status})`);
+      }
+
+      filesDoc = new DOMParser().parseFromString(
+        await filesResponse.text(),
+        'text/html',
+      );
+      found = findReviewToken(filesDoc, pr);
     }
 
-    const doc = new DOMParser().parseFromString(
-      await filesResponse.text(),
-      'text/html',
-    );
-    const form = doc.querySelector('form[action$="/reviews"]');
-    const token = form?.querySelector('input[name="authenticity_token"]')?.value;
-
-    if (!token) {
-      throw new Error('review form / csrf token not found on the files page');
-    }
-
-    const submitResponse = await fetch(
-      new URL(form.getAttribute('action'), location.origin),
-      {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' },
-        body: new URLSearchParams({
-          authenticity_token: token,
-          'pull_request_review[event]': 'approve',
-          'pull_request_review[body]': comment,
+    if (!found) {
+      console.log(
+        '[GitHub PR Approve Helper] csrf discovery details:',
+        JSON.stringify({
+          livePage: describeTokenSearch(document),
+          filesPage: filesDoc && describeTokenSearch(filesDoc),
         }),
-      },
-    );
+      );
+      throw new Error(
+        'no csrf token found - paste the "csrf discovery details" console line to debug',
+      );
+    }
+
+    const submitResponse = await fetch(new URL(found.path, location.origin), {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      body: new URLSearchParams({
+        authenticity_token: found.token,
+        'pull_request_review[event]': 'approve',
+        'pull_request_review[body]': comment,
+      }),
+    });
 
     if (!submitResponse.ok) {
       throw new Error(`approve request failed (${submitResponse.status})`);
@@ -423,7 +508,7 @@
     button.id = BUTTON_ID;
     button.type = 'button';
     button.textContent = '✅ Quick approve';
-    button.title = `Approve Helper v${VERSION} - approve this PR without opening the review dialog`;
+    button.title = `Approve Helper v${VERSION} - click: approve with ${DEFAULT_COMMENT} · right-click: choose text`;
     button.style.cssText = [
       'position: fixed',
       'bottom: 16px',
@@ -438,7 +523,13 @@
       'cursor: pointer',
       'z-index: 2147483647',
     ].join(';');
-    button.addEventListener('click', toggleQuickApproveMenu);
+    // click approves immediately with the default comment, right-click
+    // opens the menu to approve with a different text
+    button.addEventListener('click', () => onQuickApprove(DEFAULT_COMMENT));
+    button.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      toggleQuickApproveMenu();
+    });
 
     document.body.appendChild(button);
   };
