@@ -318,16 +318,21 @@
     return null;
   };
 
+  // the failure diagnostic keeps at most this many token paths, so a huge
+  // csrf_tokens map can't flood the console on every fallback
+  const MAX_DIAGNOSTIC_PATHS = 20;
+
   // scan one document for a review csrf token, in every known place github
   // puts one: the legacy review form, then the csrf_tokens maps embedded in
   // the json payloads of the new react pages. also returns what was
-  // searched (paths only, never token values), so the failure diagnostic
-  // always describes the actual search
+  // searched (a count and a bounded sample of paths, never token values),
+  // so the failure diagnostic always describes the actual search
   const scanForReviewToken = (doc, pr) => {
     const scripts = [...doc.querySelectorAll('script[type="application/json"]')];
     const stats = {
       jsonScripts: scripts.length,
       reviewForms: doc.querySelectorAll('form[action$="/reviews"]').length,
+      csrfTokenPathCount: 0,
       csrfTokenPaths: [],
     };
 
@@ -359,7 +364,15 @@
         continue;
       }
 
-      stats.csrfTokenPaths.push(...Object.keys(map));
+      const paths = Object.keys(map);
+      stats.csrfTokenPathCount += paths.length;
+      stats.csrfTokenPaths.push(
+        ...paths.slice(
+          0,
+          Math.max(0, MAX_DIAGNOSTIC_PATHS - stats.csrfTokenPaths.length),
+        ),
+      );
+
       const entry = Object.entries(map).find(([path]) =>
         path.endsWith(`/pull/${pr.number}/reviews`),
       );
