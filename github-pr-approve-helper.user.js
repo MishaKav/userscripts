@@ -498,7 +498,10 @@
       throw new Error('submit button not found in the review dialog');
     }
 
-    await waitFor(() => !submitButton.disabled, 3000);
+    const enabled = await waitFor(() => !submitButton.disabled, 3000);
+    if (!enabled) {
+      throw new Error('submit button never became enabled');
+    }
     submitButton.click();
 
     // the dialog going away is the sign the review was submitted
