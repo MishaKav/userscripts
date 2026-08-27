@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.1.0
+// @version      1.2.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -56,6 +56,7 @@
   const DROPDOWN_ID = 'gpah-comment-select';
   const BUTTON_ID = 'gpah-quick-approve';
   const MENU_ID = 'gpah-quick-approve-menu';
+  const INDICATOR_ID = 'gpah-approved-badge';
 
   // set while the quick-approve button is busy or showing its result, so
   // the page scan leaves it alone until it returns to idle
@@ -79,6 +80,12 @@
       'textarea[placeholder="Leave a comment"]', // react fallback
       'textarea', // last resort, scoped to the review container only
     ],
+    // the merged/closed badge in the pr header (legacy and react markup)
+    STATE_BADGE: '.State, [class*="StateLabel"], [title^="Status:"]',
+    // places that mention "<user> approved these changes": the reviewers
+    // sidebar and the conversation timeline
+    REVIEW_ACTIVITY:
+      '.discussion-sidebar-item, [class*="Sidebar"], .TimelineItem, [class*="TimelineItem"], [aria-label*="approved" i]',
   };
 
   const parsePrPath = () => {
@@ -88,8 +95,8 @@
 
   const prKey = (pr) => `${pr.owner}/${pr.repo}#${pr.number}`;
 
-  const prPagePath = (pr, page) =>
-    `/${pr.owner}/${pr.repo}/pull/${pr.number}/${page}`;
+  const prPagePath = (pr, page = '') =>
+    `/${pr.owner}/${pr.repo}/pull/${pr.number}${page ? `/${page}` : ''}`;
 
   const isPullRequestPage = () => Boolean(parsePrPath());
 
@@ -524,8 +531,160 @@
     }
   };
 
-  // PRs approved through the button this session, so it doesn't re-appear
-  const approvedPrs = new Set();
+  // ===== PR STATE =====
+
+  const APPROVED_STORAGE_KEY = 'gpah-approved-prs';
+  const MAX_STORED_APPROVALS = 200;
+
+  const loadApprovedPrs = () => {
+    try {
+      return new Set(
+        JSON.parse(localStorage.getItem(APPROVED_STORAGE_KEY)) ?? [],
+      );
+    } catch {
+      return new Set();
+    }
+  };
+
+  // PRs approved through the button, kept across sessions
+  const approvedPrs = loadApprovedPrs();
+
+  const saveApprovedPr = (key) => {
+    approvedPrs.add(key);
+    try {
+      localStorage.setItem(
+        APPROVED_STORAGE_KEY,
+        JSON.stringify([...approvedPrs].slice(-MAX_STORED_APPROVALS)),
+      );
+    } catch {
+      // storage unavailable - the in-memory set still covers this session
+    }
+  };
+
+  const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const getMyLogin = () =>
+    document.querySelector('meta[name="user-login"]')?.content;
+
+  // read the pr state out of a document: the merged/closed badge in the
+  // header, or an "approved these changes" entry for the logged-in user in
+  // the sidebar/timeline. null when the document shows neither
+  const detectPrStateInDoc = (doc, me) => {
+    for (const badge of doc.querySelectorAll(SELECTORS.STATE_BADGE)) {
+      const text = badge.textContent.trim().toLowerCase();
+      const title = (badge.getAttribute('title') ?? '').toLowerCase();
+
+      if (text === 'merged' || title === 'status: merged') {
+        return 'merged';
+      }
+      if (text === 'closed' || title === 'status: closed') {
+        return 'closed';
+      }
+    }
+
+    if (me) {
+      const approvedByMe = new RegExp(
+        `\\b${escapeRegExp(me)}\\b[\\s\\S]{0,60}?approved these changes`,
+        'i',
+      );
+
+      for (const item of doc.querySelectorAll(SELECTORS.REVIEW_ACTIVITY)) {
+        if (
+          approvedByMe.test(item.getAttribute('aria-label') ?? '') ||
+          approvedByMe.test(item.textContent)
+        ) {
+          return 'approved';
+        }
+      }
+    }
+
+    return null;
+  };
+
+  const prStateCache = new Map(); // prKey -> merged | closed | approved | open
+  const prStateFetches = new Set(); // prKeys with a conversation fetch running
+
+  // what to show for this pr: merged/closed hide the button, approved shows
+  // the passive indicator, open shows the button. layered: our own recorded
+  // approvals, then the live page, then (from other tabs) one cached fetch
+  // of the conversation page. unknown always falls open to the button
+  const getPrDisplayState = (pr) => {
+    const key = prKey(pr);
+
+    if (approvedPrs.has(key)) {
+      return 'approved';
+    }
+
+    const cached = prStateCache.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const liveState = detectPrStateInDoc(document, getMyLogin());
+    if (liveState) {
+      prStateCache.set(key, liveState);
+      console.log(`[GitHub PR Approve Helper] pr state: ${liveState} (live page)`);
+      return liveState;
+    }
+
+    // the conversation tab shows every signal - nothing found means open
+    if (location.pathname === prPagePath(pr)) {
+      prStateCache.set(key, 'open');
+      return 'open';
+    }
+
+    // other tabs lack the sidebar/timeline - ask the conversation page once
+    if (!prStateFetches.has(key)) {
+      prStateFetches.add(key);
+      fetch(prPagePath(pr), { credentials: 'include' })
+        .then((response) => (response.ok ? response.text() : null))
+        .then((html) => {
+          const state = html
+            ? (detectPrStateInDoc(
+                new DOMParser().parseFromString(html, 'text/html'),
+                getMyLogin(),
+              ) ?? 'open')
+            : 'open'; // fetch failed - fail open
+          prStateCache.set(key, state);
+          console.log(
+            `[GitHub PR Approve Helper] pr state: ${state} (conversation page)`,
+          );
+          scheduleScan();
+        })
+        .catch(() => prStateCache.set(key, 'open'));
+    }
+
+    return 'open'; // fail open while the fetch resolves
+  };
+
+  // per-pr dismissal of the indicator, so a click hides it until the next
+  // navigation to a different pr
+  let indicatorDismissedFor = null;
+
+  const createApprovedIndicator = (key) => {
+    const badge = document.createElement('div');
+    badge.id = INDICATOR_ID;
+    badge.textContent = '👍 Already approved';
+    badge.title = 'You already approved this PR - click to hide';
+    badge.style.cssText = [
+      'position: fixed',
+      'bottom: 16px',
+      'right: 16px',
+      'padding: 6px 12px',
+      'background: #eaeef2',
+      'color: #57606a',
+      'font: 600 12px -apple-system, sans-serif',
+      'border: 1px solid #d0d7de',
+      'border-radius: 6px',
+      'cursor: pointer',
+      'z-index: 2147483647',
+    ].join(';');
+    badge.addEventListener('click', () => {
+      indicatorDismissedFor = key;
+      badge.remove();
+    });
+    return badge;
+  };
 
   // state: 'busy' | 'done' | 'error', or null when back to idle
   const setButtonState = (button, text, background, state) => {
@@ -570,10 +729,13 @@
         );
         await submitViaUi(comment, pr);
       }
-      approvedPrs.add(prKey(pr));
+      saveApprovedPr(prKey(pr));
       setButtonState(button, '🎉 Approved', '#1f883d', 'done');
       console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)}: "${comment}"`);
-      setTimeout(() => button.remove(), 4000);
+      setTimeout(() => {
+        button.remove();
+        scheduleScan(); // hands over to the "already approved" indicator
+      }, 4000);
     } catch (error) {
       setButtonState(button, '❌ Approve failed - see console', '#cf222e', 'error');
       button.disabled = false;
@@ -639,18 +801,37 @@
   const ensureQuickApproveButton = () => {
     const pr = parsePrPath();
     const existing = document.getElementById(BUTTON_ID);
-    const wanted =
-      SHOW_QUICK_APPROVE && pr && isAllowedOrgPage() && !approvedPrs.has(prKey(pr));
+    const indicator = document.getElementById(INDICATOR_ID);
+    const state =
+      SHOW_QUICK_APPROVE && pr && isAllowedOrgPage()
+        ? getPrDisplayState(pr)
+        : null;
 
-    if (!wanted) {
-      // a button in a non-idle state is approving or showing its result -
-      // its own timeout ends that, don't yank it mid-feedback
-      if (existing && !existing.hasAttribute(BUTTON_STATE_ATTRIBUTE)) {
+    // a button in a non-idle state is approving or showing its result -
+    // its own timeout ends that, don't yank it mid-feedback
+    const removableButton =
+      existing && !existing.hasAttribute(BUTTON_STATE_ATTRIBUTE);
+
+    if (state !== 'open') {
+      if (removableButton) {
         existing.remove();
         closeQuickApproveMenu();
       }
+
+      if (state === 'approved') {
+        // passive indicator instead of the button - approving again from
+        // here would be a double approve
+        if (!indicator && !existing && indicatorDismissedFor !== prKey(pr)) {
+          document.body.appendChild(createApprovedIndicator(prKey(pr)));
+        }
+      } else {
+        // merged/closed pr, or not a pr page at all: no widget
+        indicator?.remove();
+      }
       return;
     }
+
+    indicator?.remove();
 
     if (existing) {
       return;
