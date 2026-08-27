@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.2.0
+// @version      1.3.0
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -80,12 +80,14 @@
       'textarea[placeholder="Leave a comment"]', // react fallback
       'textarea', // last resort, scoped to the review container only
     ],
-    // the merged/closed badge in the pr header (legacy and react markup)
-    STATE_BADGE: '.State, [class*="StateLabel"], [title^="Status:"]',
-    // places that mention "<user> approved these changes": the reviewers
-    // sidebar and the conversation timeline
+    // the merged/closed badge in the pr header. the react markup (verified
+    // on a real pr) is <span data-component="StateLabel" data-status="pullMerged">
+    STATE_BADGE:
+      '[data-component="StateLabel"], .State, [class*="StateLabel"], [title^="Status:"]',
+    // places that mention "<user> approved these changes": the reviewer
+    // tooltips in the sidebar and the conversation timeline
     REVIEW_ACTIVITY:
-      '.discussion-sidebar-item, [class*="Sidebar"], .TimelineItem, [class*="TimelineItem"], [aria-label*="approved" i]',
+      'tool-tip, .discussion-sidebar-item, [class*="Sidebar"], .TimelineItem, [class*="TimelineItem"], [aria-label*="approved" i]',
   };
 
   const parsePrPath = () => {
@@ -533,33 +535,9 @@
 
   // ===== PR STATE =====
 
-  const APPROVED_STORAGE_KEY = 'gpah-approved-prs';
-  const MAX_STORED_APPROVALS = 200;
-
-  const loadApprovedPrs = () => {
-    try {
-      return new Set(
-        JSON.parse(localStorage.getItem(APPROVED_STORAGE_KEY)) ?? [],
-      );
-    } catch {
-      return new Set();
-    }
-  };
-
-  // PRs approved through the button, kept across sessions
-  const approvedPrs = loadApprovedPrs();
-
-  const saveApprovedPr = (key) => {
-    approvedPrs.add(key);
-    try {
-      localStorage.setItem(
-        APPROVED_STORAGE_KEY,
-        JSON.stringify([...approvedPrs].slice(-MAX_STORED_APPROVALS)),
-      );
-    } catch {
-      // storage unavailable - the in-memory set still covers this session
-    }
-  };
+  // PRs approved through the button in this session; on later visits the
+  // page/fetch detection below recognizes the approval instead
+  const approvedPrs = new Set();
 
   const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -571,18 +549,30 @@
   // the sidebar/timeline. null when the document shows neither
   const detectPrStateInDoc = (doc, me) => {
     for (const badge of doc.querySelectorAll(SELECTORS.STATE_BADGE)) {
+      const status = (badge.getAttribute('data-status') ?? '').toLowerCase();
       const text = badge.textContent.trim().toLowerCase();
       const title = (badge.getAttribute('title') ?? '').toLowerCase();
 
-      if (text === 'merged' || title === 'status: merged') {
+      if (status.includes('merged') || text === 'merged' || title === 'status: merged') {
         return 'merged';
       }
-      if (text === 'closed' || title === 'status: closed') {
+      if (status.includes('closed') || text === 'closed' || title === 'status: closed') {
         return 'closed';
       }
     }
 
     if (me) {
+      // reviewers sidebar renders one <a id="review-status-<login>"> per
+      // reviewer, with an octicon inside encoding the verdict - the check
+      // icon means approved (verified markup)
+      const myReviewStatus = doc.getElementById(`review-status-${me}`);
+      if (
+        myReviewStatus?.querySelector('.octicon-check, [aria-label*="approved" i]')
+      ) {
+        return 'approved';
+      }
+
+      // reviewer tooltips / timeline: "<me> approved these changes"
       const approvedByMe = new RegExp(
         `\\b${escapeRegExp(me)}\\b[\\s\\S]{0,60}?approved these changes`,
         'i',
@@ -729,7 +719,7 @@
         );
         await submitViaUi(comment, pr);
       }
-      saveApprovedPr(prKey(pr));
+      approvedPrs.add(prKey(pr));
       setButtonState(button, '🎉 Approved', '#1f883d', 'done');
       console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)}: "${comment}"`);
       setTimeout(() => {
