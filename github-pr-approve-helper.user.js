@@ -565,6 +565,26 @@
     }
 
     if (me) {
+      // my own pr - github forbids approving it, so no button on it.
+      // classic pages mark the header author with rel="author" (verified:
+      // exactly one per page); the react header renders
+      // "<a href=/author>author</a> wants to merge ..."
+      const relAuthor = doc.querySelector('a[rel="author"]');
+      const wantsToMerge = new RegExp(
+        `^\\s*${escapeRegExp(me)}\\b[\\s\\S]{0,10}?wants to merge`,
+        'i',
+      );
+      const isOwn =
+        relAuthor?.getAttribute('href') === `/${me}` ||
+        [...doc.querySelectorAll(`a[href="/${me}"]`)].some((link) => {
+          const text = link.parentElement?.textContent ?? '';
+          return text.length <= 300 && wantsToMerge.test(text);
+        });
+
+      if (isOwn) {
+        return { state: 'own', via: 'pr author' };
+      }
+
       // reviewers sidebar renders one <a id="review-status-<login>"> per
       // reviewer, with an octicon inside encoding the verdict - the check
       // icon means approved (verified markup). a pending request renders a
@@ -601,11 +621,11 @@
     return null;
   };
 
-  const prStateCache = new Map(); // prKey -> merged | closed | approved | open
+  const prStateCache = new Map(); // prKey -> merged|closed|own|approved|open
   const prStateFetches = new Set(); // prKeys with a conversation fetch running
 
-  // what to show for this pr: merged/closed hide the button, approved shows
-  // the passive indicator, open shows the button. layered: our own recorded
+  // what to show for this pr: merged/closed/own hide the button, approved
+  // shows the passive indicator, open shows the button. layered: our own recorded
   // approvals, then the live page, then (from other tabs) one cached fetch
   // of the conversation page. unknown always falls open to the button
   const getPrDisplayState = (pr) => {
