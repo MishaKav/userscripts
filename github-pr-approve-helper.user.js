@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.3.0
+// @version      1.3.1
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.3.0';
+  const VERSION = '1.3.1';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -84,10 +84,12 @@
     // on a real pr) is <span data-component="StateLabel" data-status="pullMerged">
     STATE_BADGE:
       '[data-component="StateLabel"], .State, [class*="StateLabel"], [title^="Status:"]',
-    // places that mention "<user> approved these changes": the reviewer
-    // tooltips in the sidebar and the conversation timeline
-    REVIEW_ACTIVITY:
-      'tool-tip, .discussion-sidebar-item, [class*="Sidebar"], .TimelineItem, [class*="TimelineItem"], [aria-label*="approved" i]',
+    // small elements whose own text can say "<user> approved these
+    // changes": reviewer tooltips and timeline entries. deliberately NO
+    // sidebar/section containers - their concatenated text can juxtapose my
+    // name with someone else's approval and produce a false positive
+    REVIEW_APPROVAL_TEXT:
+      'tool-tip, [aria-label*="approved these changes" i], .TimelineItem-body, .TimelineItem',
   };
 
   const parsePrPath = () => {
@@ -547,6 +549,7 @@
   // read the pr state out of a document: the merged/closed badge in the
   // header, or an "approved these changes" entry for the logged-in user in
   // the sidebar/timeline. null when the document shows neither
+  // returns { state, via } or null; `via` names the signal for the log
   const detectPrStateInDoc = (doc, me) => {
     for (const badge of doc.querySelectorAll(SELECTORS.STATE_BADGE)) {
       const status = (badge.getAttribute('data-status') ?? '').toLowerCase();
@@ -554,36 +557,43 @@
       const title = (badge.getAttribute('title') ?? '').toLowerCase();
 
       if (status.includes('merged') || text === 'merged' || title === 'status: merged') {
-        return 'merged';
+        return { state: 'merged', via: 'state badge' };
       }
       if (status.includes('closed') || text === 'closed' || title === 'status: closed') {
-        return 'closed';
+        return { state: 'closed', via: 'state badge' };
       }
     }
 
     if (me) {
       // reviewers sidebar renders one <a id="review-status-<login>"> per
       // reviewer, with an octicon inside encoding the verdict - the check
-      // icon means approved (verified markup)
+      // icon means approved (verified markup). a pending request renders a
+      // different icon, so it stays "open"
       const myReviewStatus = doc.getElementById(`review-status-${me}`);
-      if (
-        myReviewStatus?.querySelector('.octicon-check, [aria-label*="approved" i]')
-      ) {
-        return 'approved';
+      if (myReviewStatus?.querySelector('.octicon-check')) {
+        return { state: 'approved', via: 'sidebar icon' };
       }
 
-      // reviewer tooltips / timeline: "<me> approved these changes"
+      // a tooltip or timeline entry whose OWN text starts with
+      // "<me> approved these changes" - anchored, so another reviewer's
+      // approval can never match; long texts are containers, skip them
       const approvedByMe = new RegExp(
-        `\\b${escapeRegExp(me)}\\b[\\s\\S]{0,60}?approved these changes`,
+        `^\\s*${escapeRegExp(me)}\\b[\\s\\S]{0,10}?approved these changes`,
         'i',
       );
 
-      for (const item of doc.querySelectorAll(SELECTORS.REVIEW_ACTIVITY)) {
+      for (const item of doc.querySelectorAll(SELECTORS.REVIEW_APPROVAL_TEXT)) {
+        const label = item.getAttribute('aria-label') ?? '';
+        const text = item.textContent;
+
         if (
-          approvedByMe.test(item.getAttribute('aria-label') ?? '') ||
-          approvedByMe.test(item.textContent)
+          approvedByMe.test(label) ||
+          (text.length <= 200 && approvedByMe.test(text))
         ) {
-          return 'approved';
+          return {
+            state: 'approved',
+            via: `text "${(label || text).trim().slice(0, 120)}"`,
+          };
         }
       }
     }
@@ -610,11 +620,13 @@
       return cached;
     }
 
-    const liveState = detectPrStateInDoc(document, getMyLogin());
-    if (liveState) {
-      prStateCache.set(key, liveState);
-      console.log(`[GitHub PR Approve Helper] pr state: ${liveState} (live page)`);
-      return liveState;
+    const liveDetection = detectPrStateInDoc(document, getMyLogin());
+    if (liveDetection) {
+      prStateCache.set(key, liveDetection.state);
+      console.log(
+        `[GitHub PR Approve Helper] pr state: ${liveDetection.state} (live page, via ${liveDetection.via})`,
+      );
+      return liveDetection.state;
     }
 
     // the conversation tab shows every signal - nothing found means open
@@ -629,15 +641,18 @@
       fetch(prPagePath(pr), { credentials: 'include' })
         .then((response) => (response.ok ? response.text() : null))
         .then((html) => {
-          const state = html
-            ? (detectPrStateInDoc(
+          const detection = html
+            ? detectPrStateInDoc(
                 new DOMParser().parseFromString(html, 'text/html'),
                 getMyLogin(),
-              ) ?? 'open')
-            : 'open'; // fetch failed - fail open
+              )
+            : null; // fetch failed - fail open
+          const state = detection?.state ?? 'open';
           prStateCache.set(key, state);
           console.log(
-            `[GitHub PR Approve Helper] pr state: ${state} (conversation page)`,
+            `[GitHub PR Approve Helper] pr state: ${state} (conversation page${
+              detection ? `, via ${detection.via}` : ''
+            })`,
           );
           scheduleScan();
         })
