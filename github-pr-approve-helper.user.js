@@ -622,7 +622,9 @@
   };
 
   const prStateCache = new Map(); // prKey -> merged|closed|own|approved|open
-  const prStateFetches = new Set(); // prKeys with a conversation fetch running
+  // prKeys whose conversation-page fetch was already started - one fetch
+  // per pr, its result lands in prStateCache (entries are never removed)
+  const prStateFetches = new Set();
 
   // what to show for this pr: merged/closed/own hide the button, approved
   // shows the passive indicator, open shows the button. layered: our own recorded
@@ -687,8 +689,10 @@
   let indicatorDismissedFor = null;
 
   const createApprovedIndicator = (key) => {
-    const badge = document.createElement('div');
+    // a real button, so dismissing works with the keyboard too
+    const badge = document.createElement('button');
     badge.id = INDICATOR_ID;
+    badge.type = 'button';
     badge.textContent = '👍 Already approved';
     badge.title = 'You already approved this PR - click to hide';
     badge.style.cssText = [
