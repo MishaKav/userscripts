@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.3.0
+// @version      1.3.1
 // @description  Auto-fills the review comment with LGTM on Approve, adds a quick-approve button and can approve a whole stack of PRs
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.3.0';
+  const VERSION = '1.3.1';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -650,9 +650,12 @@
   const prStateFetches = new Set();
 
   // what to show for this pr: merged/closed/own hide the button, approved
-  // shows the passive indicator, open shows the button. layered: our own recorded
-  // approvals, then the live page, then (from other tabs) one cached fetch
-  // of the conversation page. unknown always falls open to the button
+  // shows the passive indicator, open shows the button. layered: our own
+  // recorded approvals, then one cached fetch of the conversation page
+  // (authoritative), and until that lands a hint from the live page.
+  // the hint is never cached: during github's soft navigation the url
+  // already names the next pr while the previous pr's sidebar is still in
+  // the dom, and caching that would pin the wrong state on the new pr
   const getPrDisplayState = (pr) => {
     const key = prKey(pr);
 
@@ -665,22 +668,6 @@
       return cached;
     }
 
-    const liveDetection = detectPrStateInDoc(document, getMyLogin());
-    if (liveDetection) {
-      prStateCache.set(key, liveDetection.state);
-      console.log(
-        `[GitHub PR Approve Helper] pr state: ${liveDetection.state} (live page, via ${liveDetection.via})`,
-      );
-      return liveDetection.state;
-    }
-
-    // the conversation tab shows every signal - nothing found means open
-    if (location.pathname === prPagePath(pr)) {
-      prStateCache.set(key, 'open');
-      return 'open';
-    }
-
-    // other tabs lack the sidebar/timeline - ask the conversation page once
     if (!prStateFetches.has(key)) {
       prStateFetches.add(key);
       fetch(prPagePath(pr), { credentials: 'include' })
@@ -702,6 +689,15 @@
           scheduleScan();
         })
         .catch(() => prStateCache.set(key, 'open'));
+    }
+
+    // the live page is only a hint while the fetch is in flight, and only
+    // once the tab title names this pr ("… · Pull Request #254 · org/repo")
+    if (document.title.includes(`#${pr.number}`)) {
+      const liveDetection = detectPrStateInDoc(document, getMyLogin());
+      if (liveDetection) {
+        return liveDetection.state;
+      }
     }
 
     return 'open'; // fail open while the fetch resolves
