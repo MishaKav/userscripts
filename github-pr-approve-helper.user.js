@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.2.0
+// @version      1.2.1
 // @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.2.0';
+  const VERSION = '1.2.1';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -541,6 +541,11 @@
   // page/fetch detection below recognizes the approval instead
   const approvedPrs = new Set();
 
+  // the pr states a header badge can show: data-status "pullMerged" /
+  // "pullClosed" / "pullOpened" / "pullDraft" in the react header, the
+  // badge text or a "Status: Merged" title on the classic one
+  const PR_BADGE_STATES = ['merged', 'closed', 'open', 'draft'];
+
   const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   const getMyLogin = () =>
@@ -551,17 +556,30 @@
   // the sidebar/timeline. null when the document shows neither
   // returns { state, via } or null; `via` names the signal for the log
   const detectPrStateInDoc = (doc, me) => {
+    // only the pr header badge counts, and it comes first in the document.
+    // timeline cross-references ("this was referenced by #250") and linked
+    // issues render their own "Merged"/"Closed" badges further down, which
+    // must not hide the button on an open pr - so the first badge that
+    // reads as a pr state decides, and an "open"/"draft" header ends the scan
     for (const badge of doc.querySelectorAll(SELECTORS.STATE_BADGE)) {
       const status = (badge.getAttribute('data-status') ?? '').toLowerCase();
       const text = badge.textContent.trim().toLowerCase();
       const title = (badge.getAttribute('title') ?? '').toLowerCase();
 
-      if (status.includes('merged') || text === 'merged' || title === 'status: merged') {
-        return { state: 'merged', via: 'state badge' };
+      const state = PR_BADGE_STATES.find(
+        (name) =>
+          status.includes(name) || text === name || title === `status: ${name}`,
+      );
+
+      if (!state) {
+        continue;
       }
-      if (status.includes('closed') || text === 'closed' || title === 'status: closed') {
-        return { state: 'closed', via: 'state badge' };
+
+      const via = `state badge "${status || title || text}"`;
+      if (state === 'merged' || state === 'closed') {
+        return { state, via };
       }
+      break; // open or draft header - the pr is open, ignore later badges
     }
 
     if (me) {
