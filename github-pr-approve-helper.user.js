@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.2.1
-// @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
+// @version      1.3.0
+// @description  Auto-fills the review comment with LGTM on Approve, adds a quick-approve button and can approve a whole stack of PRs
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
 // @match        https://github.com/linear-b/*
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.2.1';
+  const VERSION = '1.3.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -52,6 +52,11 @@
   // show a floating quick-approve button on PR pages - click it to pick a
   // comment and approve the PR without opening the review dialog
   const SHOW_QUICK_APPROVE = true;
+
+  // on a PR that is part of a github stack, offer "approve whole stack" in
+  // the right-click menu of the quick-approve button. the plain click still
+  // approves only the current PR - the stack run is always a manual pick
+  const STACK_APPROVE = true;
 
   const DROPDOWN_ID = 'gpah-comment-select';
   const BUTTON_ID = 'gpah-quick-approve';
@@ -702,6 +707,156 @@
     return 'open'; // fail open while the fetch resolves
   };
 
+  // ===== STACKS =====
+
+  // the stack badge in the pr header ("2/3" with a layers icon, next to the
+  // state label) - it opens the stack map popover. its text gives the
+  // position and size without opening anything
+  const getStackBadge = () => {
+    for (const el of document.querySelectorAll('button, summary, a')) {
+      const match = el.textContent.trim().match(/^(\d+)\s*\/\s*(\d+)$/);
+      // must sit next to the pr state label, so a "1/2" elsewhere on the
+      // page (a checks counter, pagination) is never taken for the badge
+      const nearStateLabel = el.parentElement
+        ?.closest('*')
+        ?.parentElement?.querySelector(SELECTORS.STATE_BADGE);
+      if (match && el.querySelector('svg') && nearStateLabel) {
+        return { el, position: Number(match[1]), size: Number(match[2]) };
+      }
+    }
+    return null;
+  };
+
+  // walk the json payloads github embeds in the page for the pr's stack:
+  // graphql-shaped `stack: { number, size, entries: [{ position,
+  // pullRequest: { number } }] }`, tolerant to flattened entries or an
+  // `edges/nodes` connection. returns [{ number, position }] or []
+  const collectStackFromPayload = (doc, pr) => {
+    const entries = new Map(); // pr number -> position
+
+    const collectEntries = (node, position, depth) => {
+      if (!node || typeof node !== 'object' || depth > 8) {
+        return;
+      }
+      if (Array.isArray(node)) {
+        node.forEach((item) => collectEntries(item, position, depth + 1));
+        return;
+      }
+      const ownPosition = Number.isInteger(node.position) ? node.position : position;
+      const isPr =
+        Number.isInteger(node.number) &&
+        !('size' in node) &&
+        !('entries' in node) &&
+        (typeof node.title === 'string' ||
+          'headRefName' in node ||
+          'headRef' in node ||
+          Number.isInteger(ownPosition));
+      if (isPr) {
+        entries.set(node.number, ownPosition ?? entries.get(node.number) ?? null);
+      }
+      for (const value of Object.values(node)) {
+        collectEntries(value, ownPosition, depth + 1);
+      }
+    };
+
+    // find every object that sits under a key named like "stack"
+    const findStacks = (node, depth) => {
+      if (!node || typeof node !== 'object' || depth > 12) {
+        return;
+      }
+      for (const [key, value] of Object.entries(node)) {
+        if (/stack/i.test(key) && value && typeof value === 'object') {
+          collectEntries(value, undefined, 0);
+        }
+        findStacks(value, depth + 1);
+      }
+    };
+
+    for (const script of doc.querySelectorAll('script[type="application/json"]')) {
+      if (/stack/i.test(script.textContent)) {
+        findStacks(safeJsonParse(script.textContent), 0);
+      }
+    }
+
+    // a real stack of this pr contains this pr
+    if (!entries.has(Number(pr.number))) {
+      return [];
+    }
+    return [...entries].map(([number, position]) => ({ number, position }));
+  };
+
+  // fallback: read the stack map popover ("Stack #257" listing "#255 ·
+  // branch" rows). opens it through the badge when closed, and closes it
+  // again with escape
+  const collectStackFromPopover = async (pr, badge) => {
+    const prefix = `/${pr.owner}/${pr.repo}/pull/`;
+    const findPopover = () =>
+      [...document.querySelectorAll('[role="dialog"], [data-component="Popover"], [class*="Overlay" i], dialog, div')].find(
+        (el) =>
+          /^\s*Stack #\d+/.test(el.textContent) &&
+          el.textContent.length < 5000 &&
+          el.querySelector(`a[href*="${prefix}"]`),
+      );
+
+    let popover = findPopover();
+    let opened = false;
+    if (!popover && badge) {
+      badge.el.click();
+      opened = true;
+      popover = await waitFor(findPopover, 3000);
+    }
+    if (!popover) {
+      return [];
+    }
+
+    const numbers = [];
+    for (const link of popover.querySelectorAll(`a[href*="${prefix}"]`)) {
+      const number = Number(link.getAttribute('href').split(prefix)[1]?.match(/^\d+/)?.[0]);
+      if (number && !numbers.includes(number)) {
+        numbers.push(number);
+      }
+    }
+
+    if (opened) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      popover.querySelector('button[aria-label*="close" i]')?.click();
+    }
+
+    // the popover lists top of the stack first - flip to bottom-first
+    return numbers.reverse().map((number, index) => ({ number, position: index + 1 }));
+  };
+
+  // the prs of this pr's stack, bottom (closest to the trunk) first
+  const findStackPrs = async (pr, badge) => {
+    let entries = collectStackFromPayload(document, pr);
+    let via = 'page payload';
+
+    if (entries.length < 2) {
+      entries = await collectStackFromPopover(pr, badge);
+      via = 'stack popover';
+    }
+
+    entries.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+    console.log(
+      `[GitHub PR Approve Helper] stack of ${prKey(pr)}: ${
+        entries.map((e) => `#${e.number}`).join(', ') || 'not found'
+      } (via ${via})`,
+    );
+    return entries.map((entry) => ({ ...pr, number: String(entry.number) }));
+  };
+
+  // state of another pr of the stack, from its conversation page - so the
+  // stack run skips merged/closed/own/already-approved prs instead of
+  // failing on them
+  const fetchPrState = async (pr) => {
+    const response = await fetch(prPagePath(pr), { credentials: 'include' });
+    if (!response.ok) {
+      throw new Error(`pr page failed to load (${response.status})`);
+    }
+    const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+    return detectPrStateInDoc(doc, getMyLogin())?.state ?? 'open';
+  };
+
   // per-pr dismissal of the indicator, so a click hides it until the next
   // navigation to a different pr
   let indicatorDismissedFor = null;
@@ -748,7 +903,51 @@
   const closeQuickApproveMenu = () =>
     document.getElementById(MENU_ID)?.remove();
 
-  const onQuickApprove = async (comment) => {
+  // approve the whole stack, bottom to top. the current pr may fall back
+  // to driving the ui; the others are approved directly or reported
+  const approveStack = async (comment, pr, button) => {
+    const prs = await findStackPrs(pr, getStackBadge());
+    if (prs.length < 2) {
+      throw new Error('could not read the stack - see the "stack of" console line');
+    }
+
+    const results = { approved: [], skipped: [], failed: [] };
+
+    for (const [index, member] of prs.entries()) {
+      setButtonState(button, `⏳ Approving ${index + 1}/${prs.length}…`, '#9a6700', 'busy');
+      const key = prKey(member);
+      const isCurrent = member.number === pr.number;
+
+      try {
+        const state = isCurrent ? 'open' : await fetchPrState(member);
+        if (state !== 'open') {
+          results.skipped.push(`${key} (${state})`);
+          continue;
+        }
+
+        try {
+          await submitApproval(comment, member);
+        } catch (directError) {
+          if (!isCurrent) {
+            throw directError;
+          }
+          console.log(
+            `[GitHub PR Approve Helper] direct approve failed (${directError.message}), driving the ui instead`,
+          );
+          await submitViaUi(comment, member);
+        }
+        approvedPrs.add(key);
+        results.approved.push(key);
+      } catch (error) {
+        results.failed.push(`${key} (${error.message})`);
+      }
+    }
+
+    console.log(`[GitHub PR Approve Helper] stack run: ${JSON.stringify(results)}`);
+    return results;
+  };
+
+  const onQuickApprove = async (comment, { stack = false } = {}) => {
     closeQuickApproveMenu();
     const button = document.getElementById(BUTTON_ID);
     const pr = parsePrPath();
@@ -768,17 +967,33 @@
     setButtonState(button, '⏳ Approving…', '#9a6700', 'busy');
 
     try {
-      try {
-        await submitApproval(comment, pr);
-      } catch (directError) {
-        console.log(
-          `[GitHub PR Approve Helper] direct approve failed (${directError.message}), driving the ui instead`,
+      if (stack) {
+        const { approved, skipped, failed } = await approveStack(comment, pr, button);
+        const total = approved.length + skipped.length + failed.length;
+        if (failed.length) {
+          throw new Error(
+            `approved ${approved.length}/${total} of the stack, failed: ${failed.join('; ')}`,
+          );
+        }
+        setButtonState(
+          button,
+          `🎉 Stack approved ${approved.length}/${total}${skipped.length ? ` (${skipped.length} skipped)` : ''}`,
+          '#1f883d',
+          'done',
         );
-        await submitViaUi(comment, pr);
+      } else {
+        try {
+          await submitApproval(comment, pr);
+        } catch (directError) {
+          console.log(
+            `[GitHub PR Approve Helper] direct approve failed (${directError.message}), driving the ui instead`,
+          );
+          await submitViaUi(comment, pr);
+        }
+        approvedPrs.add(prKey(pr));
+        setButtonState(button, '🎉 Approved', '#1f883d', 'done');
       }
-      approvedPrs.add(prKey(pr));
-      setButtonState(button, '🎉 Approved', '#1f883d', 'done');
-      console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)}: "${comment}"`);
+      console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)}${stack ? ' (stack)' : ''}: "${comment}"`);
       setTimeout(() => {
         button.remove();
         scheduleScan(); // hands over to the "already approved" indicator
@@ -840,6 +1055,18 @@
     for (const comment of comments) {
       menu.appendChild(createMenuRow(`✅ ${comment}`, () => onQuickApprove(comment)));
     }
+    const badge = STACK_APPROVE && getStackBadge();
+    if (badge) {
+      const divider = document.createElement('div');
+      divider.style.cssText = 'border-top: 1px solid #d0d7de; margin: 4px 0';
+      menu.appendChild(divider);
+      menu.appendChild(
+        createMenuRow(`🥞 Approve whole stack (${badge.size} PRs) with ${DEFAULT_COMMENT}`, () =>
+          onQuickApprove(DEFAULT_COMMENT, { stack: true }),
+        ),
+      );
+    }
+
     menu.appendChild(createMenuRow('Cancel', closeQuickApproveMenu, true));
 
     document.body.appendChild(menu);
@@ -888,7 +1115,7 @@
     button.id = BUTTON_ID;
     button.type = 'button';
     button.textContent = '✅ Quick approve';
-    button.title = `Approve Helper v${VERSION} - click: approve with ${DEFAULT_COMMENT} · right-click: choose text`;
+    button.title = `Approve Helper v${VERSION} - click: approve with ${DEFAULT_COMMENT} · right-click: choose text or approve the whole stack`;
     button.style.cssText = [
       'position: fixed',
       'bottom: 16px',
