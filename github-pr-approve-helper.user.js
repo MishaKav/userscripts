@@ -321,8 +321,9 @@
   // the caller wants are never parsed
   const jsonPayloads = (doc, needle) =>
     [...doc.querySelectorAll('script[type="application/json"]')]
-      .filter((script) => script.textContent.includes(needle))
-      .map((script) => safeJsonParse(script.textContent))
+      .map((script) => script.textContent ?? '')
+      .filter((text) => text.includes(needle))
+      .map(safeJsonParse)
       .filter(Boolean);
 
   // walk a parsed react payload for a `csrf_tokens: {path: {method: token}}`
@@ -1011,11 +1012,19 @@
         );
       }
 
-      const label = stack
-        ? `🎉 Stack approved ${approved.length}/${total}${skipped.length ? ` (${skipped.length} skipped)` : ''}`
-        : '🎉 Approved';
-      setButtonState(button, label, '#1f883d', 'done');
-      console.log(`[GitHub PR Approve Helper] approved ${approved.join(', ')}: "${comment}"`);
+      // nothing approved: every pr was skipped (e.g. it got merged or was
+      // approved in another tab meanwhile) - say so, never claim an approval
+      const label = !approved.length
+        ? `⏭️ Nothing to approve (${skipped.map((entry) => entry.match(/\((\w+)\)$/)?.[1]).join(', ')})`
+        : stack
+          ? `🎉 Stack approved ${approved.length}/${total}${skipped.length ? ` (${skipped.length} skipped)` : ''}`
+          : '🎉 Approved';
+      setButtonState(button, label, approved.length ? '#1f883d' : '#57606a', 'done');
+      console.log(
+        `[GitHub PR Approve Helper] ${
+          approved.length ? `approved ${approved.join(', ')}: "${comment}"` : `skipped ${skipped.join(', ')}`
+        }`,
+      );
       setTimeout(() => {
         button.remove();
         scheduleScan(); // hands over to the "already approved" indicator
