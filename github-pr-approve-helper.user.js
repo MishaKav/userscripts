@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.2.0
-// @description  A userscript that auto-fills the review comment with LGTM when you select Approve in the GitHub pull request review dialog
+// @version      1.3.0
+// @description  Auto-fills the review comment with LGTM on Approve, adds a quick-approve button and can approve a whole stack of PRs
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
 // @match        https://github.com/linear-b/*
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -52,6 +52,11 @@
   // show a floating quick-approve button on PR pages - click it to pick a
   // comment and approve the PR without opening the review dialog
   const SHOW_QUICK_APPROVE = true;
+
+  // on a PR that is part of a github stack, offer "approve whole stack" in
+  // the right-click menu of the quick-approve button. the plain click still
+  // approves only the current PR - the stack run is always a manual pick
+  const STACK_APPROVE = true;
 
   const DROPDOWN_ID = 'gpah-comment-select';
   const BUTTON_ID = 'gpah-quick-approve';
@@ -311,6 +316,16 @@
     }
   };
 
+  // the parsed json payloads github embeds in a page - only the scripts
+  // whose text mentions `needle`, so the huge ones that can't hold what
+  // the caller wants are never parsed
+  const jsonPayloads = (doc, needle) =>
+    [...doc.querySelectorAll('script[type="application/json"]')]
+      .map((script) => script.textContent ?? '')
+      .filter((text) => text.includes(needle))
+      .map(safeJsonParse)
+      .filter(Boolean);
+
   // walk a parsed react payload for a `csrf_tokens: {path: {method: token}}`
   // object, the way the new github ui embeds its csrf tokens
   const findCsrfTokensMap = (node) => {
@@ -339,9 +354,8 @@
   // searched (a count and a bounded sample of paths, never token values),
   // so the failure diagnostic always describes the actual search
   const scanForReviewToken = (doc, pr) => {
-    const scripts = [...doc.querySelectorAll('script[type="application/json"]')];
     const stats = {
-      jsonScripts: scripts.length,
+      jsonScripts: doc.querySelectorAll('script[type="application/json"]').length,
       reviewForms: doc.querySelectorAll('form[action$="/reviews"]').length,
       csrfTokenPathCount: 0,
       csrfTokenPaths: [],
@@ -363,14 +377,8 @@
       };
     }
 
-    for (const script of scripts) {
-      // github embeds huge page payloads in these scripts - skip the json
-      // parse and walk for the ones that can't contain a csrf_tokens map
-      if (!script.textContent.includes('csrf_tokens')) {
-        continue;
-      }
-
-      const map = findCsrfTokensMap(safeJsonParse(script.textContent));
+    for (const payload of jsonPayloads(doc, 'csrf_tokens')) {
+      const map = findCsrfTokensMap(payload);
       if (!map) {
         continue;
       }
@@ -401,13 +409,13 @@
   };
 
   // approve the PR the same way github's own ui does: find a fresh csrf
-  // token (on the live page, or on the fetched files page) and post the
-  // approve to the reviews endpoint with the session cookies
-  const submitApproval = async (comment, pr) => {
-    // the page we're already on may embed the token
-    const liveScan = scanForReviewToken(document, pr);
+  // token (in the given documents - the live page by default - then on
+  // the fetched files page) and post the approve to the reviews endpoint
+  // with the session cookies
+  const submitApproval = async (comment, pr, docs = [document]) => {
+    const scans = docs.map((doc) => scanForReviewToken(doc, pr));
     let filesScan = null;
-    let found = liveScan.found;
+    let found = scans.map((scan) => scan.found).find(Boolean);
 
     if (!found) {
       const filesResponse = await fetch(prPagePath(pr, 'files'), {
@@ -430,7 +438,7 @@
       console.log(
         '[GitHub PR Approve Helper] csrf discovery details:',
         JSON.stringify({
-          livePage: liveScan.stats,
+          givenPages: scans.map((scan) => scan.stats),
           filesPage: filesScan?.stats ?? null,
         }),
       );
@@ -541,6 +549,11 @@
   // page/fetch detection below recognizes the approval instead
   const approvedPrs = new Set();
 
+  // the pr states a header badge can show: data-status "pullMerged" /
+  // "pullClosed" / "pullOpened" / "pullDraft" in the react header, the
+  // badge text or a "Status: Merged" title on the classic one
+  const PR_BADGE_STATES = ['merged', 'closed', 'open', 'draft'];
+
   const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   const getMyLogin = () =>
@@ -551,17 +564,30 @@
   // the sidebar/timeline. null when the document shows neither
   // returns { state, via } or null; `via` names the signal for the log
   const detectPrStateInDoc = (doc, me) => {
+    // only the pr header badge counts, and it comes first in the document.
+    // timeline cross-references ("this was referenced by #250") and linked
+    // issues render their own "Merged"/"Closed" badges further down, which
+    // must not hide the button on an open pr - so the first badge that
+    // reads as a pr state decides, and an "open"/"draft" header ends the scan
     for (const badge of doc.querySelectorAll(SELECTORS.STATE_BADGE)) {
       const status = (badge.getAttribute('data-status') ?? '').toLowerCase();
       const text = badge.textContent.trim().toLowerCase();
       const title = (badge.getAttribute('title') ?? '').toLowerCase();
 
-      if (status.includes('merged') || text === 'merged' || title === 'status: merged') {
-        return { state: 'merged', via: 'state badge' };
+      const state = PR_BADGE_STATES.find(
+        (name) =>
+          status.includes(name) || text === name || title === `status: ${name}`,
+      );
+
+      if (!state) {
+        continue;
       }
-      if (status.includes('closed') || text === 'closed' || title === 'status: closed') {
-        return { state: 'closed', via: 'state badge' };
+
+      const via = `state badge "${status || title || text}"`;
+      if (state === 'merged' || state === 'closed') {
+        return { state, via };
       }
+      break; // open or draft header - the pr is open, ignore later badges
     }
 
     if (me) {
@@ -622,14 +648,57 @@
   };
 
   const prStateCache = new Map(); // prKey -> merged|closed|own|approved|open
-  // prKeys whose conversation-page fetch was already started - one fetch
-  // per pr, its result lands in prStateCache (entries are never removed)
-  const prStateFetches = new Set();
+  const prStateLoads = new Map(); // prKey -> in-flight loadPrState promise
+
+  // the parsed conversation page of a pr, fetched with the session cookies
+  const fetchPrDoc = async (pr) => {
+    const response = await fetch(prPagePath(pr), { credentials: 'include' });
+    if (!response.ok) {
+      throw new Error(`pr page failed to load (${response.status})`);
+    }
+    return new DOMParser().parseFromString(await response.text(), 'text/html');
+  };
+
+  // the pr state from its conversation page (it shows every signal), one
+  // fetch per pr for the whole session, shared by the button and the
+  // stack run. a failed fetch fails open. `doc` skips the fetch when the
+  // caller already has the page
+  const loadPrState = (pr, doc = null) => {
+    const key = prKey(pr);
+    const known = approvedPrs.has(key) ? 'approved' : prStateCache.get(key);
+    if (known) {
+      return Promise.resolve(known);
+    }
+    if (!prStateLoads.has(key)) {
+      const load = (doc ? Promise.resolve(doc) : fetchPrDoc(pr))
+        .then((page) => detectPrStateInDoc(page, getMyLogin()))
+        .catch(() => null)
+        .then((detection) => {
+          const state = detection?.state ?? 'open';
+          prStateCache.set(key, state);
+          console.log(
+            `[GitHub PR Approve Helper] pr state: ${state} (conversation page${
+              detection ? `, via ${detection.via}` : ''
+            })`,
+          );
+          scheduleScan();
+          return state;
+        });
+      prStateLoads.set(key, load);
+    }
+    return prStateLoads.get(key);
+  };
+
+  // the live page shows this pr - during github's soft navigation the url
+  // already names the next pr while the previous pr's page is still in
+  // the dom, and the tab title ("… · Pull Request #254 · org/repo") is
+  // what flips last
+  const livePageShows = (pr) => document.title.includes(`#${pr.number}`);
 
   // what to show for this pr: merged/closed/own hide the button, approved
-  // shows the passive indicator, open shows the button. layered: our own recorded
-  // approvals, then the live page, then (from other tabs) one cached fetch
-  // of the conversation page. unknown always falls open to the button
+  // shows the passive indicator, open shows the button. our own recorded
+  // approvals first, then the cached conversation-page state, and until
+  // that lands an uncached hint from the live page
   const getPrDisplayState = (pr) => {
     const key = prKey(pr);
 
@@ -642,46 +711,162 @@
       return cached;
     }
 
-    const liveDetection = detectPrStateInDoc(document, getMyLogin());
-    if (liveDetection) {
-      prStateCache.set(key, liveDetection.state);
+    // already on the conversation page: it is the authoritative document,
+    // read synchronously so the button never flashes on a merged/approved pr
+    if (livePageShows(pr) && location.pathname === prPagePath(pr)) {
+      const detection = detectPrStateInDoc(document, getMyLogin());
+      const state = detection?.state ?? 'open';
+      prStateCache.set(key, state);
       console.log(
-        `[GitHub PR Approve Helper] pr state: ${liveDetection.state} (live page, via ${liveDetection.via})`,
+        `[GitHub PR Approve Helper] pr state: ${state} (live conversation page${
+          detection ? `, via ${detection.via}` : ''
+        })`,
       );
-      return liveDetection.state;
+      return state;
     }
 
-    // the conversation tab shows every signal - nothing found means open
-    if (location.pathname === prPagePath(pr)) {
-      prStateCache.set(key, 'open');
-      return 'open';
-    }
+    loadPrState(pr);
 
-    // other tabs lack the sidebar/timeline - ask the conversation page once
-    if (!prStateFetches.has(key)) {
-      prStateFetches.add(key);
-      fetch(prPagePath(pr), { credentials: 'include' })
-        .then((response) => (response.ok ? response.text() : null))
-        .then((html) => {
-          const detection = html
-            ? detectPrStateInDoc(
-                new DOMParser().parseFromString(html, 'text/html'),
-                getMyLogin(),
-              )
-            : null; // fetch failed - fail open
-          const state = detection?.state ?? 'open';
-          prStateCache.set(key, state);
-          console.log(
-            `[GitHub PR Approve Helper] pr state: ${state} (conversation page${
-              detection ? `, via ${detection.via}` : ''
-            })`,
-          );
-          scheduleScan();
-        })
-        .catch(() => prStateCache.set(key, 'open'));
+    if (livePageShows(pr)) {
+      const liveDetection = detectPrStateInDoc(document, getMyLogin());
+      if (liveDetection) {
+        return liveDetection.state;
+      }
     }
 
     return 'open'; // fail open while the fetch resolves
+  };
+
+  // ===== STACKS =====
+
+  // the stack badge in the pr header ("2/3" with a layers icon, next to the
+  // state label) - it opens the stack map popover. its text gives the
+  // position and size without opening anything
+  const getStackBadge = () => {
+    for (const el of document.querySelectorAll('button, summary, a')) {
+      const match = el.textContent.trim().match(/^(\d+)\s*\/\s*(\d+)$/);
+      if (!match || !el.querySelector('svg')) {
+        continue;
+      }
+      // must sit next to the pr state label, so a "1/2" elsewhere on the
+      // page (a checks counter, pagination) is never taken for the badge
+      if (el.parentElement?.parentElement?.querySelector(SELECTORS.STATE_BADGE)) {
+        return { el, position: Number(match[1]), size: Number(match[2]) };
+      }
+    }
+    return null;
+  };
+
+  // the pr's stack from the json payloads github embeds in the page, in
+  // the documented graphql shape: `stack: { number, size, entries:
+  // [{ position, pullRequest: { number } }] }` (entries may sit under
+  // `nodes` or `edges[].node`). returns [{ number, position }], empty
+  // when no stack object of that shape lists this pr
+  const collectStackFromPayload = (doc, pr) => {
+    const entries = new Map(); // pr number -> position
+
+    const collectEntries = (node, depth = 0) => {
+      if (!node || typeof node !== 'object' || depth > 4) {
+        return;
+      }
+      if (Array.isArray(node)) {
+        node.forEach((item) => collectEntries(item, depth + 1));
+        return;
+      }
+      const target = node.pullRequest ?? node;
+      if (Number.isInteger(node.position) && Number.isInteger(target.number)) {
+        entries.set(target.number, node.position);
+        return;
+      }
+      Object.values(node).forEach((value) => collectEntries(value, depth + 1));
+    };
+
+    const isStack = (node) =>
+      node && typeof node === 'object' && !Array.isArray(node) && 'entries' in node;
+
+    const findStacks = (node, depth = 0) => {
+      if (!node || typeof node !== 'object' || depth > 12) {
+        return;
+      }
+      for (const value of Object.values(node)) {
+        if (isStack(value)) {
+          collectEntries(value.entries);
+        } else {
+          findStacks(value, depth + 1);
+        }
+      }
+    };
+
+    jsonPayloads(doc, 'entries').forEach((payload) => findStacks(payload));
+
+    if (!entries.has(Number(pr.number))) {
+      return [];
+    }
+    return [...entries].map(([number, position]) => ({ number, position }));
+  };
+
+  // fallback: read the stack map popover ("Stack #257" listing "#255 ·
+  // branch" rows). opens it through the badge when closed, and closes it
+  // again with escape
+  const collectStackFromPopover = async (pr, badge) => {
+    const linkSelector = `a[href*="${prPagePath({ ...pr, number: '' })}"]`;
+
+    // the popover is the closest ancestor of a pr link whose text starts
+    // with the "Stack #N" heading
+    const findPopover = () => {
+      for (const link of document.querySelectorAll(linkSelector)) {
+        for (let el = link.parentElement; el && el !== document.body; el = el.parentElement) {
+          if (/^\s*Stack #\d+/.test(el.textContent)) {
+            return el;
+          }
+        }
+      }
+      return null;
+    };
+
+    let popover = findPopover();
+    const opened = !popover && badge;
+    if (opened) {
+      badge.el.click();
+      popover = await waitFor(findPopover, 3000);
+    }
+    if (!popover) {
+      return [];
+    }
+
+    const numbers = [
+      ...new Set(
+        [...popover.querySelectorAll(linkSelector)]
+          .map((link) => Number(link.getAttribute('href').match(/\/pull\/(\d+)/)?.[1]))
+          .filter(Boolean),
+      ),
+    ];
+
+    if (opened) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    }
+
+    // the popover lists the top of the stack first - flip to bottom-first
+    return numbers.reverse().map((number, index) => ({ number, position: index + 1 }));
+  };
+
+  // the prs of this pr's stack, bottom (closest to the trunk) first
+  const findStackPrs = async (pr, badge) => {
+    let entries = collectStackFromPayload(document, pr);
+    let via = 'page payload';
+
+    if (entries.length < 2) {
+      entries = await collectStackFromPopover(pr, badge);
+      via = 'stack popover';
+    }
+
+    entries.sort((a, b) => a.position - b.position);
+    console.log(
+      `[GitHub PR Approve Helper] stack of ${prKey(pr)}: ${
+        entries.map((e) => `#${e.number}`).join(', ') || 'not found'
+      } (via ${via})`,
+    );
+    return entries.map((entry) => ({ ...pr, number: String(entry.number) }));
   };
 
   // per-pr dismissal of the indicator, so a click hides it until the next
@@ -730,7 +915,57 @@
   const closeQuickApproveMenu = () =>
     document.getElementById(MENU_ID)?.remove();
 
-  const onQuickApprove = async (comment) => {
+  // approve one pr: directly, or - for the pr open in the tab - by driving
+  // github's own review dialog when the direct post fails. prs other than
+  // the current one come with their fetched conversation page, which also
+  // serves the csrf token search
+  const approvePr = async (comment, pr, doc = null) => {
+    const isCurrent = pr.number === parsePrPath()?.number;
+    try {
+      await submitApproval(comment, pr, doc ? [doc, document] : [document]);
+    } catch (directError) {
+      if (!isCurrent) {
+        throw directError;
+      }
+      console.log(
+        `[GitHub PR Approve Helper] direct approve failed (${directError.message}), driving the ui instead`,
+      );
+      await submitViaUi(comment, pr);
+    }
+    approvedPrs.add(prKey(pr));
+  };
+
+  // approve several prs in order, skipping the ones that can't take an
+  // approval (merged, closed, mine, already approved). one page fetch per
+  // pr, shared between the state check and the csrf token search
+  const approvePrs = async (comment, prs, onProgress) => {
+    const results = { approved: [], skipped: [], failed: [] };
+
+    for (const [index, pr] of prs.entries()) {
+      onProgress(index + 1, prs.length);
+      const key = prKey(pr);
+
+      try {
+        const isCurrent = pr.number === parsePrPath()?.number;
+        const doc = isCurrent ? null : await fetchPrDoc(pr);
+        const state = isCurrent ? getPrDisplayState(pr) : await loadPrState(pr, doc);
+        if (state !== 'open') {
+          results.skipped.push(`${key} (${state})`);
+          continue;
+        }
+        await approvePr(comment, pr, doc);
+        results.approved.push(key);
+      } catch (error) {
+        results.failed.push(`${key} (${error.message})`);
+      }
+    }
+
+    return results;
+  };
+
+  // `stack` (the header badge) approves the whole stack instead of the
+  // current pr only
+  const onQuickApprove = async (comment, stack = null) => {
     closeQuickApproveMenu();
     const button = document.getElementById(BUTTON_ID);
     const pr = parsePrPath();
@@ -750,17 +985,46 @@
     setButtonState(button, '⏳ Approving…', '#9a6700', 'busy');
 
     try {
-      try {
-        await submitApproval(comment, pr);
-      } catch (directError) {
-        console.log(
-          `[GitHub PR Approve Helper] direct approve failed (${directError.message}), driving the ui instead`,
-        );
-        await submitViaUi(comment, pr);
+      let prs = [pr];
+      if (stack) {
+        prs = await findStackPrs(pr, stack);
+        if (prs.length < 2) {
+          throw new Error('could not read the stack - see the "stack of" console line');
+        }
       }
-      approvedPrs.add(prKey(pr));
-      setButtonState(button, '🎉 Approved', '#1f883d', 'done');
-      console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)}: "${comment}"`);
+
+      const results = await approvePrs(comment, prs, (done, total) => {
+        if (stack) {
+          setButtonState(button, `⏳ Approving ${done}/${total}…`, '#9a6700', 'busy');
+        }
+      });
+      const { approved, skipped, failed } = results;
+      const total = prs.length;
+
+      if (stack) {
+        console.log(`[GitHub PR Approve Helper] stack run: ${JSON.stringify(results)}`);
+      }
+      if (failed.length) {
+        throw new Error(
+          stack
+            ? `approved ${approved.length}/${total} of the stack, failed: ${failed.join('; ')}`
+            : failed[0],
+        );
+      }
+
+      // nothing approved: every pr was skipped (e.g. it got merged or was
+      // approved in another tab meanwhile) - say so, never claim an approval
+      const label = !approved.length
+        ? `⏭️ Nothing to approve (${skipped.map((entry) => entry.match(/\((\w+)\)$/)?.[1]).join(', ')})`
+        : stack
+          ? `🎉 Stack approved ${approved.length}/${total}${skipped.length ? ` (${skipped.length} skipped)` : ''}`
+          : '🎉 Approved';
+      setButtonState(button, label, approved.length ? '#1f883d' : '#57606a', 'done');
+      console.log(
+        `[GitHub PR Approve Helper] ${
+          approved.length ? `approved ${approved.join(', ')}: "${comment}"` : `skipped ${skipped.join(', ')}`
+        }`,
+      );
       setTimeout(() => {
         button.remove();
         scheduleScan(); // hands over to the "already approved" indicator
@@ -822,6 +1086,18 @@
     for (const comment of comments) {
       menu.appendChild(createMenuRow(`✅ ${comment}`, () => onQuickApprove(comment)));
     }
+    const badge = STACK_APPROVE && getStackBadge();
+    if (badge) {
+      const divider = document.createElement('div');
+      divider.style.cssText = 'border-top: 1px solid #d0d7de; margin: 4px 0';
+      menu.appendChild(divider);
+      menu.appendChild(
+        createMenuRow(`🥞 Approve whole stack (${badge.size} PRs) with ${DEFAULT_COMMENT}`, () =>
+          onQuickApprove(DEFAULT_COMMENT, badge),
+        ),
+      );
+    }
+
     menu.appendChild(createMenuRow('Cancel', closeQuickApproveMenu, true));
 
     document.body.appendChild(menu);
@@ -870,7 +1146,7 @@
     button.id = BUTTON_ID;
     button.type = 'button';
     button.textContent = '✅ Quick approve';
-    button.title = `Approve Helper v${VERSION} - click: approve with ${DEFAULT_COMMENT} · right-click: choose text`;
+    button.title = `Approve Helper v${VERSION} - click: approve with ${DEFAULT_COMMENT} · right-click: choose text or approve the whole stack`;
     button.style.cssText = [
       'position: fixed',
       'bottom: 16px',
