@@ -710,10 +710,18 @@
       return cached;
     }
 
-    // already on the conversation page: it is the authoritative document
+    // already on the conversation page: it is the authoritative document,
+    // read synchronously so the button never flashes on a merged/approved pr
     if (livePageShows(pr) && location.pathname === prPagePath(pr)) {
-      loadPrState(pr, document);
-      return prStateCache.get(key) ?? 'open';
+      const detection = detectPrStateInDoc(document, getMyLogin());
+      const state = detection?.state ?? 'open';
+      prStateCache.set(key, state);
+      console.log(
+        `[GitHub PR Approve Helper] pr state: ${state} (live conversation page${
+          detection ? `, via ${detection.via}` : ''
+        })`,
+      );
+      return state;
     }
 
     loadPrState(pr);
