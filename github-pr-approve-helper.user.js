@@ -738,7 +738,7 @@
       // page); the react headers render "<a href=/author>author</a> wants
       // to merge ..." or, in the new overview, "... opened 2 days ago"
       const relAuthor = doc.querySelector('a[rel="author"]');
-      const authoredByMe = textStartsWithMe(me, 'wants to merge|opened');
+      const authoredByMe = textStartsWithMe(me, 'wants to merge|\\bopened\\b');
       const isOwn =
         payload?.authorLogin?.toLowerCase() === me.toLowerCase() ||
         relAuthor?.getAttribute('href') === `/${me}` ||
