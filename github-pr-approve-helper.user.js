@@ -362,48 +362,50 @@
   // headSha, ... }, stack, repository }` (verified on a live page). only a
   // payload of THIS pr counts - after a soft navigation the scripts in the
   // dom can still describe the previous pr. null on the classic pages
-  const prPayloads = new WeakMap(); // document -> Map(prKey -> payload)
+  // lookups are remembered per parsed payload, i.e. per script element:
+  // when github replaces a script (a soft navigation back to a pr that
+  // got new commits) the new one is read afresh, never a stale head sha
+  const prPayloadLookups = new WeakMap(); // payload -> Map(prKey -> result)
   const readPrPayload = (doc, pr) => {
-    const known = prPayloads.get(doc)?.get(prKey(pr));
-    if (known) {
-      return known;
-    }
-    const found = findPrPayload(doc, pr);
-    if (found) {
-      // only hits are kept: a react page can still add its scripts later
-      if (!prPayloads.has(doc)) {
-        prPayloads.set(doc, new Map());
-      }
-      prPayloads.get(doc).set(prKey(pr), found);
-    }
-    return found;
-  };
-
-  const findPrPayload = (doc, pr) => {
+    const key = prKey(pr);
     for (const payload of jsonPayloads(doc, '"pullRequest"')) {
-      const holder = findNode(payload, (node) => {
-        const pull = node.pullRequest;
-        const repoName = node.repository?.name;
-        return (
-          pull &&
-          typeof pull === 'object' &&
-          typeof pull.state === 'string' &&
-          Number(pull.number) === Number(pr.number) &&
-          (!repoName || repoName.toLowerCase() === pr.repo.toLowerCase())
-        );
-      });
-
-      if (holder) {
-        const pull = holder.pullRequest;
-        return {
-          state: pull.state.toLowerCase(),
-          authorLogin: pull.author?.login ?? null,
-          headSha: pull.headSha ?? null,
-          stack: holder.stack ?? null,
-        };
+      if (!prPayloadLookups.has(payload)) {
+        prPayloadLookups.set(payload, new Map());
+      }
+      const lookups = prPayloadLookups.get(payload);
+      if (!lookups.has(key)) {
+        lookups.set(key, extractPrPayload(payload, pr));
+      }
+      if (lookups.get(key)) {
+        return lookups.get(key);
       }
     }
     return null;
+  };
+
+  const extractPrPayload = (payload, pr) => {
+    const holder = findNode(payload, (node) => {
+      const pull = node.pullRequest;
+      const repoName = node.repository?.name;
+      return (
+        pull &&
+        typeof pull === 'object' &&
+        typeof pull.state === 'string' &&
+        Number(pull.number) === Number(pr.number) &&
+        (!repoName || repoName.toLowerCase() === pr.repo.toLowerCase())
+      );
+    });
+
+    if (!holder) {
+      return null;
+    }
+    const pull = holder.pullRequest;
+    return {
+      state: pull.state.toLowerCase(),
+      authorLogin: pull.author?.login ?? null,
+      headSha: pull.headSha ?? null,
+      stack: holder.stack ?? null,
+    };
   };
 
   // walk a parsed react payload for a `csrf_tokens: {path: {method: token}}`
@@ -928,13 +930,6 @@
   // state label) - it opens the stack map popover. its text gives the
   // position and size without opening anything
   const getStackBadge = () => {
-    // react pages carry the stack as data - no need to find the badge
-    const pr = parsePrPath();
-    const stack = pr && readPrPayload(document, pr)?.stack;
-    if (Number(stack?.size) > 1) {
-      return { el: null, position: Number(stack.position), size: Number(stack.size) };
-    }
-
     for (const el of document.querySelectorAll('button, summary, a')) {
       const match = el.textContent.trim().match(/^(\d+)\s*\/\s*(\d+)$/);
       if (!match || !el.querySelector('svg')) {
@@ -945,6 +940,14 @@
       if (el.parentElement?.parentElement?.querySelector(SELECTORS.STATE_BADGE)) {
         return { el, position: Number(match[1]), size: Number(match[2]) };
       }
+    }
+
+    // no badge in the dom: react pages also carry the stack as data. `el`
+    // is null then, so the popover fallback has nothing to open
+    const pr = parsePrPath();
+    const stack = pr && readPrPayload(document, pr)?.stack;
+    if (Number(stack?.size) > 1) {
+      return { el: null, position: Number(stack.position), size: Number(stack.size) };
     }
     return null;
   };
