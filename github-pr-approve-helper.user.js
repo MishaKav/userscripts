@@ -362,7 +362,24 @@
   // headSha, ... }, stack, repository }` (verified on a live page). only a
   // payload of THIS pr counts - after a soft navigation the scripts in the
   // dom can still describe the previous pr. null on the classic pages
+  const prPayloads = new WeakMap(); // document -> Map(prKey -> payload)
   const readPrPayload = (doc, pr) => {
+    const known = prPayloads.get(doc)?.get(prKey(pr));
+    if (known) {
+      return known;
+    }
+    const found = findPrPayload(doc, pr);
+    if (found) {
+      // only hits are kept: a react page can still add its scripts later
+      if (!prPayloads.has(doc)) {
+        prPayloads.set(doc, new Map());
+      }
+      prPayloads.get(doc).set(prKey(pr), found);
+    }
+    return found;
+  };
+
+  const findPrPayload = (doc, pr) => {
     for (const payload of jsonPayloads(doc, '"pullRequest"')) {
       const holder = findNode(payload, (node) => {
         const pull = node.pullRequest;
@@ -391,21 +408,9 @@
 
   // walk a parsed react payload for a `csrf_tokens: {path: {method: token}}`
   // object, the way the new github ui embeds its csrf tokens
-  const findCsrfTokensMap = (node) => {
-    if (!node || typeof node !== 'object') {
-      return null;
-    }
-    if (node.csrf_tokens && typeof node.csrf_tokens === 'object') {
-      return node.csrf_tokens;
-    }
-    for (const value of Object.values(node)) {
-      const found = findCsrfTokensMap(value);
-      if (found) {
-        return found;
-      }
-    }
-    return null;
-  };
+  const findCsrfTokensMap = (node) =>
+    findNode(node, (n) => n.csrf_tokens && typeof n.csrf_tokens === 'object')
+      ?.csrf_tokens ?? null;
 
   // the failure diagnostic keeps at most this many token paths, so a huge
   // csrf_tokens map can't flood the console on every fallback
@@ -471,6 +476,14 @@
     return { found: null, stats };
   };
 
+  // what github's react pages send with their own page_data requests -
+  // the verified-fetch header stands in for a csrf token
+  const PAGE_DATA_HEADERS = {
+    Accept: 'application/json',
+    'GitHub-Verified-Fetch': 'true',
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+
   // classic flow: post the review form with its csrf token
   const submitViaForm = async (found, comment) => {
     const response = await fetch(new URL(found.path, location.origin), {
@@ -497,12 +510,7 @@
     const response = await fetch(prPagePath(pr, 'page_data/submit_review'), {
       method: 'PUT',
       credentials: 'include',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        'GitHub-Verified-Fetch': 'true',
-        'X-Requested-With': 'XMLHttpRequest',
-      },
+      headers: { ...PAGE_DATA_HEADERS, 'Content-Type': 'application/json' },
       body: JSON.stringify({ body: comment, event: 'approve', headSha }),
     });
     const result = safeJsonParse(await response.text());
@@ -548,18 +556,7 @@
       }
     }
 
-    const filesResponse = await fetch(prPagePath(pr, 'files'), {
-      credentials: 'include',
-    });
-
-    if (!filesResponse.ok) {
-      throw new Error(`review form page failed to load (${filesResponse.status})`);
-    }
-
-    const filesScan = scanForReviewToken(
-      new DOMParser().parseFromString(await filesResponse.text(), 'text/html'),
-      pr,
-    );
+    const filesScan = scanForReviewToken(await fetchPrDoc(pr, 'files'), pr);
 
     if (!filesScan.found) {
       console.log(
@@ -682,6 +679,11 @@
 
   const squash = (text) => text.replace(/\s+/g, ' ').trim();
 
+  // longer texts are containers (a whole timeline, a sidebar), never the
+  // single line that names me - skipped before any regex work. generous,
+  // because server-rendered markup is mostly indentation
+  const MAX_RAW_TEXT = 2000;
+
   // matches a text that starts with my name followed by `phrase` (a regex
   // alternation). github shows a user as "login" or, depending on the
   // org's name display setting, as "Full Name (login)" - both count, and
@@ -743,8 +745,8 @@
         payload?.authorLogin?.toLowerCase() === me.toLowerCase() ||
         relAuthor?.getAttribute('href') === `/${me}` ||
         [...doc.querySelectorAll(`a[href="/${me}"]`)].some((link) => {
-          const text = squash(link.parentElement?.textContent ?? '');
-          return text.length <= 300 && authoredByMe.test(text);
+          const text = link.parentElement?.textContent ?? '';
+          return text.length <= MAX_RAW_TEXT && authoredByMe.test(squash(text));
         });
 
       if (isOwn) {
@@ -767,12 +769,10 @@
 
       for (const item of doc.querySelectorAll(SELECTORS.REVIEW_APPROVAL_TEXT)) {
         const label = item.getAttribute('aria-label') ?? '';
-        const text = squash(item.textContent);
+        const text =
+          item.textContent.length <= MAX_RAW_TEXT ? squash(item.textContent) : '';
 
-        if (
-          approvedByMe.test(label) ||
-          (text.length <= 200 && approvedByMe.test(text))
-        ) {
+        if (approvedByMe.test(label) || approvedByMe.test(text)) {
           return {
             state: 'approved',
             via: `text "${(label || text).trim().slice(0, 120)}"`,
@@ -787,9 +787,10 @@
   const prStateCache = new Map(); // prKey -> merged|closed|own|approved|open
   const prStateLoads = new Map(); // prKey -> in-flight loadPrState promise
 
-  // the parsed conversation page of a pr, fetched with the session cookies
-  const fetchPrDoc = async (pr) => {
-    const response = await fetch(prPagePath(pr), { credentials: 'include' });
+  // a parsed page of a pr (the conversation page by default), fetched
+  // with the session cookies
+  const fetchPrDoc = async (pr, page = '') => {
+    const response = await fetch(prPagePath(pr, page), { credentials: 'include' });
     if (!response.ok) {
       throw new Error(`pr page failed to load (${response.status})`);
     }
@@ -946,11 +947,7 @@
     try {
       const response = await fetch(prPagePath(pr, 'page_data/stack'), {
         credentials: 'include',
-        headers: {
-          Accept: 'application/json',
-          'GitHub-Verified-Fetch': 'true',
-          'X-Requested-With': 'XMLHttpRequest',
-        },
+        headers: PAGE_DATA_HEADERS,
       });
       return response.ok
         ? stackEntriesFromPulls((await response.json())?.stack, pr)
