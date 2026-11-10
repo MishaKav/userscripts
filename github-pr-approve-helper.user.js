@@ -556,7 +556,11 @@
       }
     }
 
-    const filesScan = scanForReviewToken(await fetchPrDoc(pr, 'files'), pr);
+    // a files page that fails to load is one more dead end, not the
+    // error to report - the submit_review failure above says more
+    const filesScan = await fetchPrDoc(pr, 'files')
+      .then((doc) => scanForReviewToken(doc, pr))
+      .catch((error) => ({ found: null, stats: { error: error.message } }));
 
     if (!filesScan.found) {
       console.log(
@@ -687,10 +691,11 @@
   // matches a text that starts with my name followed by `phrase` (a regex
   // alternation). github shows a user as "login" or, depending on the
   // org's name display setting, as "Full Name (login)" - both count, and
-  // being anchored to the start nobody else's line can match
+  // being anchored to the start nobody else's line can match (nor can a
+  // longer login that starts with mine, like "me-bot")
   const textStartsWithMe = (me, phrase) =>
     new RegExp(
-      `^\\s*(?:${escapeRegExp(me)}\\b|[^\\n]{0,80}\\(\\s*${escapeRegExp(me)}\\s*\\))[\\s\\S]{0,10}?(?:${phrase})`,
+      `^\\s*(?:${escapeRegExp(me)}(?![\\w-])|[^\\n]{0,80}\\(\\s*${escapeRegExp(me)}\\s*\\))[\\s\\S]{0,10}?(?:${phrase})`,
       'i',
     );
 
