@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.3.0
+// @version      1.4.0
 // @description  Auto-fills the review comment with LGTM on Approve, adds a quick-approve button and can approve a whole stack of PRs
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.3.0';
+  const VERSION = '1.4.0';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -94,7 +94,11 @@
     // sidebar/section containers - their concatenated text can juxtapose my
     // name with someone else's approval and produce a false positive
     REVIEW_APPROVAL_TEXT:
-      'tool-tip, [aria-label*="approved these changes" i], .TimelineItem-body, .TimelineItem',
+      'tool-tip, [role="tooltip"], [popover], [aria-label*="approved these changes" i], .TimelineItem-body, .TimelineItem',
+    // github's own analytics markers on the react review menu - they
+    // survive label changes ("Submit review" / "Submit comments" / "Review")
+    REVIEW_OPENER: '[data-dd-action-name="pull_requests.review.open"]',
+    REVIEW_SUBMIT: '[data-dd-action-name="pull_requests.review.submit"]',
   };
 
   const parsePrPath = () => {
@@ -318,31 +322,97 @@
 
   // the parsed json payloads github embeds in a page - only the scripts
   // whose text mentions `needle`, so the huge ones that can't hold what
-  // the caller wants are never parsed
+  // the caller wants are never parsed. parsed once per script element:
+  // the page scan asks for them again and again
+  const parsedPayloads = new WeakMap();
   const jsonPayloads = (doc, needle) =>
-    [...doc.querySelectorAll('script[type="application/json"]')]
-      .map((script) => script.textContent ?? '')
-      .filter((text) => text.includes(needle))
-      .map(safeJsonParse)
-      .filter(Boolean);
+    [...doc.querySelectorAll('script[type="application/json"]')].flatMap(
+      (script) => {
+        const text = script.textContent ?? '';
+        if (!text.includes(needle)) {
+          return [];
+        }
+        if (!parsedPayloads.has(script)) {
+          parsedPayloads.set(script, safeJsonParse(text));
+        }
+        const parsed = parsedPayloads.get(script);
+        return parsed ? [parsed] : [];
+      },
+    );
 
-  // walk a parsed react payload for a `csrf_tokens: {path: {method: token}}`
-  // object, the way the new github ui embeds its csrf tokens
-  const findCsrfTokensMap = (node) => {
-    if (!node || typeof node !== 'object') {
+  // depth-first search of a parsed payload for the first object passing `test`
+  const findNode = (node, test, depth = 0) => {
+    if (!node || typeof node !== 'object' || depth > 14) {
       return null;
     }
-    if (node.csrf_tokens && typeof node.csrf_tokens === 'object') {
-      return node.csrf_tokens;
+    if (!Array.isArray(node) && test(node)) {
+      return node;
     }
     for (const value of Object.values(node)) {
-      const found = findCsrfTokensMap(value);
+      const found = findNode(value, test, depth + 1);
       if (found) {
         return found;
       }
     }
     return null;
   };
+
+  // what the react pr pages (the new conversation/overview/changes views)
+  // embed about the pr: `{ pullRequest: { number, state, author: { login },
+  // headSha, ... }, stack, repository }` (verified on a live page). only a
+  // payload of THIS pr counts - after a soft navigation the scripts in the
+  // dom can still describe the previous pr. null on the classic pages
+  // lookups are remembered per parsed payload, i.e. per script element:
+  // when github replaces a script (a soft navigation back to a pr that
+  // got new commits) the new one is read afresh, never a stale head sha
+  const prPayloadLookups = new WeakMap(); // payload -> Map(prKey -> result)
+  const readPrPayload = (doc, pr) => {
+    const key = prKey(pr);
+    for (const payload of jsonPayloads(doc, '"pullRequest"')) {
+      if (!prPayloadLookups.has(payload)) {
+        prPayloadLookups.set(payload, new Map());
+      }
+      const lookups = prPayloadLookups.get(payload);
+      if (!lookups.has(key)) {
+        lookups.set(key, extractPrPayload(payload, pr));
+      }
+      if (lookups.get(key)) {
+        return lookups.get(key);
+      }
+    }
+    return null;
+  };
+
+  const extractPrPayload = (payload, pr) => {
+    const holder = findNode(payload, (node) => {
+      const pull = node.pullRequest;
+      const repoName = node.repository?.name;
+      return (
+        pull &&
+        typeof pull === 'object' &&
+        typeof pull.state === 'string' &&
+        Number(pull.number) === Number(pr.number) &&
+        (!repoName || repoName.toLowerCase() === pr.repo.toLowerCase())
+      );
+    });
+
+    if (!holder) {
+      return null;
+    }
+    const pull = holder.pullRequest;
+    return {
+      state: pull.state.toLowerCase(),
+      authorLogin: pull.author?.login ?? null,
+      headSha: pull.headSha ?? null,
+      stack: holder.stack ?? null,
+    };
+  };
+
+  // walk a parsed react payload for a `csrf_tokens: {path: {method: token}}`
+  // object, the way the new github ui embeds its csrf tokens
+  const findCsrfTokensMap = (node) =>
+    findNode(node, (n) => n.csrf_tokens && typeof n.csrf_tokens === 'object')
+      ?.csrf_tokens ?? null;
 
   // the failure diagnostic keeps at most this many token paths, so a huge
   // csrf_tokens map can't flood the console on every fallback
@@ -408,46 +478,17 @@
     return { found: null, stats };
   };
 
-  // approve the PR the same way github's own ui does: find a fresh csrf
-  // token (in the given documents - the live page by default - then on
-  // the fetched files page) and post the approve to the reviews endpoint
-  // with the session cookies
-  const submitApproval = async (comment, pr, docs = [document]) => {
-    const scans = docs.map((doc) => scanForReviewToken(doc, pr));
-    let filesScan = null;
-    let found = scans.map((scan) => scan.found).find(Boolean);
+  // what github's react pages send with their own page_data requests -
+  // the verified-fetch header stands in for a csrf token
+  const PAGE_DATA_HEADERS = {
+    Accept: 'application/json',
+    'GitHub-Verified-Fetch': 'true',
+    'X-Requested-With': 'XMLHttpRequest',
+  };
 
-    if (!found) {
-      const filesResponse = await fetch(prPagePath(pr, 'files'), {
-        credentials: 'include',
-      });
-
-      if (!filesResponse.ok) {
-        throw new Error(`review form page failed to load (${filesResponse.status})`);
-      }
-
-      const filesDoc = new DOMParser().parseFromString(
-        await filesResponse.text(),
-        'text/html',
-      );
-      filesScan = scanForReviewToken(filesDoc, pr);
-      found = filesScan.found;
-    }
-
-    if (!found) {
-      console.log(
-        '[GitHub PR Approve Helper] csrf discovery details:',
-        JSON.stringify({
-          givenPages: scans.map((scan) => scan.stats),
-          filesPage: filesScan?.stats ?? null,
-        }),
-      );
-      throw new Error(
-        'no csrf token found - paste the "csrf discovery details" console line to debug',
-      );
-    }
-
-    const submitResponse = await fetch(new URL(found.path, location.origin), {
+  // classic flow: post the review form with its csrf token
+  const submitViaForm = async (found, comment) => {
+    const response = await fetch(new URL(found.path, location.origin), {
       method: 'POST',
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
@@ -458,9 +499,89 @@
       }),
     });
 
-    if (!submitResponse.ok) {
-      throw new Error(`approve request failed (${submitResponse.status})`);
+    if (!response.ok) {
+      throw new Error(`approve request failed (${response.status})`);
     }
+  };
+
+  // new react flow, the request the "Submit review" dialog itself makes
+  // (read from github's bundle): PUT page_data/submit_review with a json
+  // body, authenticated by the session and the verified-fetch header - no
+  // csrf token. headSha pins the approval to the commit that was looked at
+  const submitViaPageData = async (pr, comment, headSha) => {
+    const response = await fetch(prPagePath(pr, 'page_data/submit_review'), {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { ...PAGE_DATA_HEADERS, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: comment, event: 'approve', headSha }),
+    });
+    const result = safeJsonParse(await response.text());
+
+    if (!response.ok || result?.error) {
+      throw new Error(
+        `submit_review failed (${response.status}${result?.error ? `: ${result.error}` : ''})`,
+      );
+    }
+  };
+
+  // approve the PR the same way github's own ui does, whichever ui that
+  // is. in order: the classic review form when one is at hand (in the
+  // given documents - the live page by default), the react endpoint when
+  // the pr payload gives a head sha, and last the classic form on the
+  // fetched files page
+  const submitApproval = async (comment, pr, docs = [document]) => {
+    const scans = docs.map((doc) => scanForReviewToken(doc, pr));
+    const found = scans.map((scan) => scan.found).find(Boolean);
+
+    if (found) {
+      await submitViaForm(found, comment);
+      return 'review form';
+    }
+
+    let headSha = docs.map((doc) => readPrPayload(doc, pr)?.headSha).find(Boolean);
+    let pageDataError = null;
+
+    if (!headSha) {
+      // e.g. a tab whose payload does not carry the pr - ask the
+      // conversation page, any failure just moves on to the next way
+      headSha = await fetchPrDoc(pr)
+        .then((doc) => readPrPayload(doc, pr)?.headSha)
+        .catch(() => null);
+    }
+
+    if (headSha) {
+      try {
+        await submitViaPageData(pr, comment, headSha);
+        return 'submit_review endpoint';
+      } catch (error) {
+        pageDataError = error.message;
+      }
+    }
+
+    // a files page that fails to load is one more dead end, not the
+    // error to report - the submit_review failure above says more
+    const filesScan = await fetchPrDoc(pr, 'files')
+      .then((doc) => scanForReviewToken(doc, pr))
+      .catch((error) => ({ found: null, stats: { error: error.message } }));
+
+    if (!filesScan.found) {
+      console.log(
+        '[GitHub PR Approve Helper] approve discovery details:',
+        JSON.stringify({
+          headSha: Boolean(headSha),
+          pageDataError,
+          givenPages: scans.map((scan) => scan.stats),
+          filesPage: filesScan.stats,
+        }),
+      );
+      throw new Error(
+        pageDataError ??
+          'no way to approve found - paste the "approve discovery details" console line to debug',
+      );
+    }
+
+    await submitViaForm(filesScan.found, comment);
+    return 'files page review form';
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -483,6 +604,7 @@
   // the review dialog, set the comment and click its submit button
   const submitViaUi = async (comment, pr) => {
     const findOpener = () =>
+      document.querySelector(SELECTORS.REVIEW_OPENER) ??
       [...document.querySelectorAll('button, summary')].find(
         (el) =>
           isSubmitReviewButton(el) && !el.closest(SELECTORS.REVIEW_CONTAINER),
@@ -490,7 +612,8 @@
 
     let opener = findOpener();
 
-    // the conversation tab has no submit review button - go to files changed
+    // no submit review button on this tab (the classic conversation tab
+    // has none) - go to files changed
     if (!opener) {
       const filesTab = document.querySelector(
         `a[href*="${prPagePath(pr, 'changes')}"], a[href*="${prPagePath(pr, 'files')}"]`,
@@ -523,6 +646,7 @@
     await sleep(200);
 
     const submitButton =
+      container.querySelector(SELECTORS.REVIEW_SUBMIT) ??
       [...container.querySelectorAll('button')].find(isSubmitReviewButton) ??
       container.querySelector('[type="submit"]');
 
@@ -559,11 +683,31 @@
   const getMyLogin = () =>
     document.querySelector('meta[name="user-login"]')?.content;
 
+  const squash = (text) => text.replace(/\s+/g, ' ').trim();
+
+  // longer texts are containers (a whole timeline, a sidebar), never the
+  // single line that names me - skipped before any regex work. generous,
+  // because server-rendered markup is mostly indentation
+  const MAX_RAW_TEXT = 2000;
+
+  // matches a text that starts with my name followed by `phrase` (a regex
+  // alternation). github shows a user as "login" or, depending on the
+  // org's name display setting, as "Full Name (login)" - both count, and
+  // being anchored to the start nobody else's line can match (nor can a
+  // longer login that starts with mine, like "me-bot")
+  const textStartsWithMe = (me, phrase) =>
+    new RegExp(
+      `^\\s*(?:${escapeRegExp(me)}(?![\\w-])|[^\\n]{0,80}\\(\\s*${escapeRegExp(me)}\\s*\\))[\\s\\S]{0,10}?(?:${phrase})`,
+      'i',
+    );
+
   // read the pr state out of a document: the merged/closed badge in the
   // header, or an "approved these changes" entry for the logged-in user in
   // the sidebar/timeline. null when the document shows neither
   // returns { state, via } or null; `via` names the signal for the log
-  const detectPrStateInDoc = (doc, me) => {
+  const detectPrStateInDoc = (doc, me, pr) => {
+    const payload = readPrPayload(doc, pr);
+
     // only the pr header badge counts, and it comes first in the document.
     // timeline cross-references ("this was referenced by #250") and linked
     // issues render their own "Merged"/"Closed" badges further down, which
@@ -590,21 +734,26 @@
       break; // open or draft header - the pr is open, ignore later badges
     }
 
+    // react pages also carry the state as data, whatever the header looks
+    // like (the badge above still goes first: it updates live on a merge)
+    if (payload?.state === 'merged' || payload?.state === 'closed') {
+      return { state: payload.state, via: 'page payload' };
+    }
+
     if (me) {
       // my own pr - github forbids approving it, so no button on it.
-      // classic pages mark the header author with rel="author" (verified:
-      // exactly one per page); the react header renders
-      // "<a href=/author>author</a> wants to merge ..."
+      // react pages name the author in their payload; classic pages mark
+      // the header author with rel="author" (verified: exactly one per
+      // page); the react headers render "<a href=/author>author</a> wants
+      // to merge ..." or, in the new overview, "... opened 2 days ago"
       const relAuthor = doc.querySelector('a[rel="author"]');
-      const wantsToMerge = new RegExp(
-        `^\\s*${escapeRegExp(me)}\\b[\\s\\S]{0,10}?wants to merge`,
-        'i',
-      );
+      const authoredByMe = textStartsWithMe(me, 'wants to merge|\\bopened\\b');
       const isOwn =
+        payload?.authorLogin?.toLowerCase() === me.toLowerCase() ||
         relAuthor?.getAttribute('href') === `/${me}` ||
-        [...doc.querySelectorAll(`a[href="/${me}"]`)].some((link) => {
+        [...doc.querySelectorAll(`a[href="/${me}" i]`)].some((link) => {
           const text = link.parentElement?.textContent ?? '';
-          return text.length <= 300 && wantsToMerge.test(text);
+          return text.length <= MAX_RAW_TEXT && authoredByMe.test(squash(text));
         });
 
       if (isOwn) {
@@ -623,23 +772,35 @@
       // a tooltip or timeline entry whose OWN text starts with
       // "<me> approved these changes" - anchored, so another reviewer's
       // approval can never match; long texts are containers, skip them
-      const approvedByMe = new RegExp(
-        `^\\s*${escapeRegExp(me)}\\b[\\s\\S]{0,10}?approved these changes`,
-        'i',
-      );
+      const approvedByMe = textStartsWithMe(me, 'approved these changes');
 
       for (const item of doc.querySelectorAll(SELECTORS.REVIEW_APPROVAL_TEXT)) {
         const label = item.getAttribute('aria-label') ?? '';
-        const text = item.textContent;
+        const text =
+          item.textContent.length <= MAX_RAW_TEXT ? squash(item.textContent) : '';
 
-        if (
-          approvedByMe.test(label) ||
-          (text.length <= 200 && approvedByMe.test(text))
-        ) {
+        if (approvedByMe.test(label) || approvedByMe.test(text)) {
           return {
             state: 'approved',
             via: `text "${(label || text).trim().slice(0, 120)}"`,
           };
+        }
+      }
+    }
+
+    if (me) {
+      // the new overview has no "approved these changes" line: its
+      // timeline shows my review as a comment headed "<me> approved 1m
+      // ago" (seen on a live page). the header is the short text around
+      // a link to my profile - its parent or grandparent
+      const approvedHeader = textStartsWithMe(me, 'approved\\b');
+
+      for (const link of doc.querySelectorAll(`a[href="/${me}" i]`)) {
+        for (const el of [link.parentElement, link.parentElement?.parentElement]) {
+          const text = el?.textContent ?? '';
+          if (text.length <= MAX_RAW_TEXT && approvedHeader.test(squash(text))) {
+            return { state: 'approved', via: `timeline "${squash(text).slice(0, 80)}"` };
+          }
         }
       }
     }
@@ -650,9 +811,10 @@
   const prStateCache = new Map(); // prKey -> merged|closed|own|approved|open
   const prStateLoads = new Map(); // prKey -> in-flight loadPrState promise
 
-  // the parsed conversation page of a pr, fetched with the session cookies
-  const fetchPrDoc = async (pr) => {
-    const response = await fetch(prPagePath(pr), { credentials: 'include' });
+  // a parsed page of a pr (the conversation page by default), fetched
+  // with the session cookies
+  const fetchPrDoc = async (pr, page = '') => {
+    const response = await fetch(prPagePath(pr, page), { credentials: 'include' });
     if (!response.ok) {
       throw new Error(`pr page failed to load (${response.status})`);
     }
@@ -671,7 +833,7 @@
     }
     if (!prStateLoads.has(key)) {
       const load = (doc ? Promise.resolve(doc) : fetchPrDoc(pr))
-        .then((page) => detectPrStateInDoc(page, getMyLogin()))
+        .then((page) => detectPrStateInDoc(page, getMyLogin(), pr))
         .catch(() => null)
         .then((detection) => {
           const state = detection?.state ?? 'open';
@@ -695,10 +857,51 @@
   // what flips last
   const livePageShows = (pr) => document.title.includes(`#${pr.number}`);
 
+  // the live page is re-read at most this often while it shows nothing
+  // that hides the button
+  const LIVE_RECHECK_MS = 1000;
+  const liveChecks = new Map(); // prKey -> { at, state } of the last live read
+  let liveRecheckTimer = null;
+
+  // what the page in the tab says about this pr right now. the react
+  // pages fill in their sidebar and header after the first paint, and a
+  // pr can get merged or approved while it is open - so an "open" reading
+  // is never final: it is taken again as the page changes, throttled,
+  // while merged/closed/own/approved are cached for the session
+  const readLivePrState = (pr) => {
+    const key = prKey(pr);
+    const last = liveChecks.get(key);
+    const age = last ? performance.now() - last.at : Infinity;
+
+    if (age < LIVE_RECHECK_MS) {
+      // mutations inside the window still get their read once it ends
+      liveRecheckTimer ??= setTimeout(() => {
+        liveRecheckTimer = null;
+        scheduleScan();
+      }, LIVE_RECHECK_MS - age);
+      return last.state;
+    }
+
+    const detection = detectPrStateInDoc(document, getMyLogin(), pr);
+    const state = detection?.state ?? 'open';
+    liveChecks.set(key, { at: performance.now(), state });
+
+    if (state !== last?.state) {
+      console.log(
+        `[GitHub PR Approve Helper] pr state: ${state} (live page${
+          detection ? `, via ${detection.via}` : ''
+        })`,
+      );
+    }
+    if (state !== 'open') {
+      prStateCache.set(key, state);
+    }
+    return state;
+  };
+
   // what to show for this pr: merged/closed/own hide the button, approved
   // shows the passive indicator, open shows the button. our own recorded
-  // approvals first, then the cached conversation-page state, and until
-  // that lands an uncached hint from the live page
+  // approvals first, then a cached final state, then the live page
   const getPrDisplayState = (pr) => {
     const key = prKey(pr);
 
@@ -707,34 +910,18 @@
     }
 
     const cached = prStateCache.get(key);
-    if (cached) {
+    if (cached && cached !== 'open') {
       return cached;
     }
 
-    // already on the conversation page: it is the authoritative document,
-    // read synchronously so the button never flashes on a merged/approved pr
-    if (livePageShows(pr) && location.pathname === prPagePath(pr)) {
-      const detection = detectPrStateInDoc(document, getMyLogin());
-      const state = detection?.state ?? 'open';
-      prStateCache.set(key, state);
-      console.log(
-        `[GitHub PR Approve Helper] pr state: ${state} (live conversation page${
-          detection ? `, via ${detection.via}` : ''
-        })`,
-      );
-      return state;
+    // on any other tab the conversation page is fetched once in the
+    // background - it shows every signal. on the conversation page itself
+    // the live document is that page already
+    if (!cached && location.pathname !== prPagePath(pr)) {
+      loadPrState(pr);
     }
 
-    loadPrState(pr);
-
-    if (livePageShows(pr)) {
-      const liveDetection = detectPrStateInDoc(document, getMyLogin());
-      if (liveDetection) {
-        return liveDetection.state;
-      }
-    }
-
-    return 'open'; // fail open while the fetch resolves
+    return livePageShows(pr) ? readLivePrState(pr) : 'open';
   };
 
   // ===== STACKS =====
@@ -754,7 +941,45 @@
         return { el, position: Number(match[1]), size: Number(match[2]) };
       }
     }
+
+    // no badge in the dom: react pages also carry the stack as data. `el`
+    // is null then, so the popover fallback has nothing to open
+    const pr = parsePrPath();
+    const stack = pr && readPrPayload(document, pr)?.stack;
+    if (Number(stack?.size) > 1) {
+      return { el: null, position: Number(stack.position), size: Number(stack.size) };
+    }
     return null;
+  };
+
+  // the react shape of a stack (the schema github's bundle validates
+  // page_data/stack against): `{ position, size, pulls: [{ number, state,
+  // ... }] }`. returns [{ number, position }], empty unless it lists this pr
+  const stackEntriesFromPulls = (stack, pr) => {
+    const pulls = Array.isArray(stack?.pulls) ? stack.pulls : [];
+    if (!pulls.some((pull) => Number(pull?.number) === Number(pr.number))) {
+      return [];
+    }
+    return pulls.map((pull, index) => ({
+      number: Number(pull.number),
+      position: index + 1,
+    }));
+  };
+
+  // the stack from github's own stack endpoint, the one its stack popover
+  // loads. empty on any failure (e.g. the classic ui)
+  const fetchStackEntries = async (pr) => {
+    try {
+      const response = await fetch(prPagePath(pr, 'page_data/stack'), {
+        credentials: 'include',
+        headers: PAGE_DATA_HEADERS,
+      });
+      return response.ok
+        ? stackEntriesFromPulls((await response.json())?.stack, pr)
+        : [];
+    } catch {
+      return [];
+    }
   };
 
   // the pr's stack from the json payloads github embeds in the page, in
@@ -825,7 +1050,7 @@
     };
 
     let popover = findPopover();
-    const opened = !popover && badge;
+    const opened = !popover && badge?.el;
     if (opened) {
       badge.el.click();
       popover = await waitFor(findPopover, 3000);
@@ -852,9 +1077,17 @@
 
   // the prs of this pr's stack, bottom (closest to the trunk) first
   const findStackPrs = async (pr, badge) => {
-    let entries = collectStackFromPayload(document, pr);
+    let entries = stackEntriesFromPulls(readPrPayload(document, pr)?.stack, pr);
     let via = 'page payload';
 
+    if (entries.length < 2) {
+      entries = await fetchStackEntries(pr);
+      via = 'stack endpoint';
+    }
+    if (entries.length < 2) {
+      entries = collectStackFromPayload(document, pr);
+      via = 'page payload (graphql shape)';
+    }
     if (entries.length < 2) {
       entries = await collectStackFromPopover(pr, badge);
       via = 'stack popover';
@@ -922,7 +1155,8 @@
   const approvePr = async (comment, pr, doc = null) => {
     const isCurrent = pr.number === parsePrPath()?.number;
     try {
-      await submitApproval(comment, pr, doc ? [doc, document] : [document]);
+      const via = await submitApproval(comment, pr, doc ? [doc, document] : [document]);
+      console.log(`[GitHub PR Approve Helper] approved ${prKey(pr)} via ${via}`);
     } catch (directError) {
       if (!isCurrent) {
         throw directError;
