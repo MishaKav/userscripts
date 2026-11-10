@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub PR Approve Helper
 // @namespace    https://github.com/MishaKav/userscripts/github-pr-approve-helper
-// @version      1.4.0
+// @version      1.4.1
 // @description  Auto-fills the review comment with LGTM on Approve, adds a quick-approve button and can approve a whole stack of PRs
 // @author       Misha Kav
 // @copyright    2026, Misha Kav
@@ -19,7 +19,7 @@
   'use strict';
 
   // keep in sync with @version above, shown in the logs and the badge
-  const VERSION = '1.4.0';
+  const VERSION = '1.4.1';
 
   // automatically select the approve option when the review dialog opens
   const AUTO_SELECT_APPROVE = true;
@@ -94,7 +94,7 @@
     // sidebar/section containers - their concatenated text can juxtapose my
     // name with someone else's approval and produce a false positive
     REVIEW_APPROVAL_TEXT:
-      'tool-tip, [role="tooltip"], [aria-label*="approved these changes" i], .TimelineItem-body, .TimelineItem',
+      'tool-tip, [role="tooltip"], [popover], [aria-label*="approved these changes" i], .TimelineItem-body, .TimelineItem',
     // github's own analytics markers on the react review menu - they
     // survive label changes ("Submit review" / "Submit comments" / "Review")
     REVIEW_OPENER: '[data-dd-action-name="pull_requests.review.open"]',
@@ -744,7 +744,7 @@
       const isOwn =
         payload?.authorLogin?.toLowerCase() === me.toLowerCase() ||
         relAuthor?.getAttribute('href') === `/${me}` ||
-        [...doc.querySelectorAll(`a[href="/${me}"]`)].some((link) => {
+        [...doc.querySelectorAll(`a[href="/${me}" i]`)].some((link) => {
           const text = link.parentElement?.textContent ?? '';
           return text.length <= MAX_RAW_TEXT && authoredByMe.test(squash(text));
         });
@@ -777,6 +777,23 @@
             state: 'approved',
             via: `text "${(label || text).trim().slice(0, 120)}"`,
           };
+        }
+      }
+    }
+
+    if (me) {
+      // the new overview has no "approved these changes" line: its
+      // timeline shows my review as a comment headed "<me> approved 1m
+      // ago" (seen on a live page). the header is the short text around
+      // a link to my profile - its parent or grandparent
+      const approvedHeader = textStartsWithMe(me, 'approved\\b');
+
+      for (const link of doc.querySelectorAll(`a[href="/${me}" i]`)) {
+        for (const el of [link.parentElement, link.parentElement?.parentElement]) {
+          const text = el?.textContent ?? '';
+          if (text.length <= MAX_RAW_TEXT && approvedHeader.test(squash(text))) {
+            return { state: 'approved', via: `timeline "${squash(text).slice(0, 80)}"` };
+          }
         }
       }
     }
